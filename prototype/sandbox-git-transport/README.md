@@ -2,7 +2,7 @@ Throwaway prototype for the Sandbox Git Transport proposal (OSEP-0027). Not prod
 
 - execd endpoints under `/v1/git`: `components/execd/pkg/web/controller/git.go`, routes in `components/execd/pkg/web/router_git.go`. Linux only. Configuration is read from `EXECD_GIT_*` environment variables here; the proposal puts it in the execd TOML file.
 - Tests need Linux and root, because they run git as a different owner to check the identity drop. Run them in a container, for example `docker run --rm -v "$PWD":/src -w /src/components/execd golang:1.25 go test ./pkg/web/controller -count=1`. `GIT_PERF=1` enables the timing experiment in `git_perf_test.go`.
-- `git-remote-opensandbox` and `e2e.sh` are the first-round Python remote helper and its script. They target the earlier `/git` routes and were not updated.
+- `git-remote-osb` is the Python remote helper for the `/v1/git` routes, and `e2e.sh` runs execd and the helper with real `git push` and `git fetch` inside a Linux container: `docker run --rm -v "$PWD":/src -w /src golang:1.25 sh prototype/sandbox-git-transport/e2e.sh` (19 checks).
 
 What the prototype established, in the order it mattered:
 
@@ -16,3 +16,11 @@ What the prototype established, in the order it mattered:
 8. Checks added after review, all passing: every `.git` entry other than `objects` and `refs` must be owned by the target uid and not group or other writable (including `config.worktree`); `include` and `includeIf` sections in `.git/config` are refused; a repository owned by uid 0 needs `run_as=0:0`; ref names are capped at 200 bytes so that 64 mappings fit in the 32 KiB query limit; error bodies carry no repository or staging path.
 9. While a body is uploading, the staged bytes exist only as an unlinked descriptor: no file is visible in the temp directory, root can read them through `/proc/self/fd` (control), and a process running as the agent uid cannot.
 10. With `Expect: 100-continue`, a request refused with 429 uploads nothing (curl sent 0 bytes). Without it, curl uploaded 1.8 MB of a 64 MiB body before reading the 429. The header saves the upload; it was not needed to see the status in this run.
+11. A root process that writes into the agent's `.git` makes the repository fail the ownership check until ownership is restored. The tests and `e2e.sh` hit this when they ran `git` as root.
+12. execd must check the git binary's path before it executes the binary as root, including for the `--exec-path` and `--version` probes. The first version ran the probe first.
+13. git's message for a stale expected-old value contains "cannot lock ref", so classifying lock errors first reported stale updates as `GIT_REF_LOCKED`. Match "but expected" first.
+14. The Go server drains an unread request body of up to 256 KiB before it sends an early response, so a client trickling a body held the connection even after the handler had decided. `Connection: close` on 408, 413, and 429 avoids that, and a stalled upload is then cut at the window (1.0 s with a 1 s window).
+15. A first push into an empty sandbox needs the helper to treat `GIT_REPO_NOT_FOUND` on `list for-push` as an empty sandbox and send `init=true`, because git lists before it pushes.
+16. A push whose tip the sandbox already has makes `git bundle create` refuse an empty bundle. A mapping whose source is an object ID, with an empty body, points the ref at an object the repository already has.
+17. Advertising sandbox tags as `refs/osb/tags/*` and mapping them to `refs/osb/<remote>/tags/*` kept `refs/tags/` empty and left a local branch named like a sandbox tag untouched, with `remote.<name>.tagOpt=--no-tags` set. Branches stay in `refs/remotes/<remote>/*`, so a sandbox branch `tags/x` does not collide with a tag.
+18. Over HTTP, curl and httpx 0.28 both received the 429 body for a rejected 64 MiB upload. Setting `Expect: 100-continue` made curl send nothing.

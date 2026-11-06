@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""PROTOTYPE git remote helper for OSEP-0027. Usage: git remote add sb osb://<host:port><repo path>.
+
+Talks to the prototype execd /v1/git routes over plain HTTP with the execd access
+token in OSB_EXECD_TOKEN. A real helper resolves the endpoint with GetEndpoint.
+"""
+import json, os, subprocess, sys, tempfile, urllib.error, urllib.parse, urllib.request, uuid
+
+remote, url = sys.argv[1], sys.argv[2]
+u = urllib.parse.urlparse(url)
+BASE, REPO = f"http://{u.netloc}", u.path or "/"
+TOKEN = os.environ.get("OSB_EXECD_TOKEN", "")
+MAX = int(os.environ.get("OSB_MAX_BUNDLE_BYTES", 256 << 20))
+REQID = str(uuid.uuid4())
+TAGS = "refs/osb/tags/"          # sandbox tags are advertised here, never as refs/tags/
+
+
+def die(msg):
+    sys.stderr.write(f"error: {msg} (request {REQID})\n")
+    sys.exit(1)
+
+
+def git(*a, inp=None, check=True):
+    return subprocess.run(["git", *a], input=inp, capture_output=True, check=check)
+
+
+def call(method, path, query=None, body=None, ctype=None):
+    q = "?" + urllib.parse.urlencode(query, doseq=True, quote_via=urllib.parse.quote) if query else ""
+    req = urllib.request.Request(BASE + path + q, data=body, method=method,
+                                 headers={"X-EXECD-ACCESS-TOKEN": TOKEN, "X-Request-ID": REQID})
+    if ctype:
+        req.add_header("Content-Type", ctype)
+    try:
+        with urllib.request.urlopen(req) as r:
+            data = r.read(MAX + 1)
+            if len(data) > MAX:
+                die("bundle exceeds the size cap")
+            return r.status, data
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(65536)
+
+
+def code_of(data):
+    try:
+        return json.loads(data).get("code", "")
+    except Exception:
+        return ""
+
+
+def out(s=""):
+    sys.stdout.write(s + "\n"); sys.stdout.flush()
+
+
+def has(sha):
+    return git("cat-file", "-e", sha + "^{commit}", check=False).returncode == 0
+
+
+INIT = False   # set when a push finds no repository: the first push creates it
+
+
+def sandbox_refs(for_push=False):
+    global INIT
+    st, data = call("GET", "/v1/git/refs", {"path": REPO})
+    if st == 404 and code_of(data) == "GIT_REPO_NOT_FOUND" and for_push:
+        INIT = True
+        return {"refs": []}
+    if st != 200:
+        die(f"list failed: {st} {code_of(data)}")
+    return json.loads(data)
+
+
+def refuse_unsupported_clients():
+    if git("rev-parse", "--is-shallow-repository").stdout.strip() == b"true":
+        die("this repository is shallow; fetch full history before pushing to a sandbox")
+    if git("config", "--get", f"remote.{remote}.promisor", check=False).stdout.strip() == b"true" or \
+       git("config", "--get", "extensions.partialClone", check=False).stdout.strip():
+        die("this repository is a partial clone, which the transport does not support")
+
+
+def configure_remote():
+    spec = f"+{TAGS}*:refs/osb/{remote}/tags/*"
+    cur = git("config", "--get-all", f"remote.{remote}.fetch", check=False).stdout.decode().split("\n")
+    if spec not in cur:
+        git("config", "--add", f"remote.{remote}.fetch", spec)
+    git("config", f"remote.{remote}.tagOpt", "--no-tags")
+
+
+def local_haves():
+    refs = git("for-each-ref", "--format=%(objectname)", f"refs/remotes/{remote}/", f"refs/osb/{remote}/").stdout.decode().split()
+    return [r for r in dict.fromkeys(refs) if has(r)]
+
+
+def parse_header(data):
+    head, sep, pack = data.partition(b"\n\n")
+    if not sep:
+        die("bundle has no header terminator")
+    lines = head.decode().split("\n")
+    if lines[0] not in ("# v2 git bundle", "# v3 git bundle") or len(lines) > 4096 or len(head) > (1 << 20):
+        die("unsupported or oversized bundle header")
+    prereqs = []
+    for l in lines[1:]:
+        if l.startswith("@"):
+            if l != "@object-format=sha1":
+                die("unsupported bundle capability")
+        elif l.startswith("-"):
+            prereqs.append(l[1:].split(" ")[0])
+    return prereqs, pack
+
+
+def import_bundle(data):
+    prereqs, pack = parse_header(data)
+    if any(not has(p) for p in prereqs):
+        die("bundle prerequisites are missing locally")
+    r = subprocess.run(["git", "index-pack", "--stdin", "--fix-thin", "--strict"], input=pack, capture_output=True)
+    if r.returncode != 0:
+        die("bundle rejected: objects failed verification")
+
+
+def cmd_list(line):
+    r = sandbox_refs(for_push=line.startswith("list for-push"))
+    for ref in r["refs"]:
+        name = ref["name"]
+        if name.startswith("refs/tags/"):
+            name = TAGS + name[len("refs/tags/"):]
+        out(f"{ref['sha']} {name}")
+    if r.get("head"):
+        out(f"@{r['head']} HEAD")
+    out()
+
+
+def real_name(name):
+    return "refs/tags/" + name[len(TAGS):] if name.startswith(TAGS) else name
+
+
+def read_batch(first):
+    lines = [first]
+    while True:
+        l = sys.stdin.readline().rstrip("\n")
+        if not l:
+            return lines
+        lines.append(l)
+
+
+def cmd_fetch(first):
+    names = [real_name(l.split(" ", 2)[2]) for l in read_batch(first)]
+    body = json.dumps({"path": REPO, "refs": names, "haves": local_haves()}).encode()
+    st, data = call("POST", "/v1/git/bundle/create", body=body, ctype="application/json")
+    if st == 200:
+        import_bundle(data)
+    elif st != 204:
+        die(f"fetch failed: {st} {code_of(data)}")
+    out()
+
+
+def cmd_push(first):
+    refresh = {r["name"]: r["sha"] for r in sandbox_refs(for_push=True)["refs"]}
+    known = [s for s in refresh.values() if has(s)]
+    for line in read_batch(first):
+        spec = line.split(" ", 1)[1]
+        force = spec.startswith("+")
+        src, dst = spec.lstrip("+").split(":", 1)
+        if not src:
+            out(f"error {dst} deletion is not supported"); continue
+        full = git("rev-parse", "--symbolic-full-name", src, check=False).stdout.decode().strip()
+        if not full.startswith("refs/"):
+            out(f"error {dst} source must be a ref"); continue
+        with tempfile.NamedTemporaryFile(suffix=".bundle") as f:
+            r = git("bundle", "create", f.name, full, *["^" + k for k in known], check=False)
+            if r.returncode == 0:
+                data, srcname = open(f.name, "rb").read(), full
+            elif b"empty bundle" in r.stderr:
+                # The sandbox already has every object: point the ref at the commit, no body.
+                data, srcname = b"", git("rev-parse", full).stdout.decode().strip()
+            else:
+                out(f"error {dst} cannot build bundle"); continue
+        mapping = ("+" if force else "") + f"{srcname}:{dst}"
+        if force and dst in refresh:
+            mapping += "@" + refresh[dst]
+        q = {"path": REPO, "ref": mapping}
+        if INIT:
+            q["init"] = "true"
+        st, body = call("POST", "/v1/git/bundle/receive", q, body=data, ctype="application/x-git-bundle")
+        if st == 422 and code_of(body) == "GIT_PREREQUISITE_MISSING":
+            with tempfile.NamedTemporaryFile(suffix=".bundle") as f:
+                git("bundle", "create", f.name, full, check=True)
+                st, body = call("POST", "/v1/git/bundle/receive", q, body=open(f.name, "rb").read(), ctype="application/x-git-bundle")
+        out(f"ok {dst}" if st == 200 else f"error {dst} {st} {code_of(body)} request {REQID}")
+    out()
+
+
+def main():
+    refuse_unsupported_clients()
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return
+        line = line.rstrip("\n")
+        if line == "capabilities":
+            configure_remote()
+            out("fetch"); out("push"); out("option"); out()
+        elif line.startswith("option"):
+            out("unsupported")
+        elif line.startswith("list"):
+            cmd_list(line)
+        elif line.startswith("fetch "):
+            cmd_fetch(line)
+        elif line.startswith("push "):
+            cmd_push(line)
+        elif line == "":
+            return
+        else:
+            die("unsupported command: " + line)
+
+
+main()

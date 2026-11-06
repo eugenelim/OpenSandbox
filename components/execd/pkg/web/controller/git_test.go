@@ -669,6 +669,23 @@ func TestExpectContinueGetsCleanBusy(t *testing.T) {
 	require.Contains(t, withExpect, "SENT=0", "the body must not be uploaded before the decision")
 	without, _ := run("")
 	t.Logf("without Expect: %s", without)
+
+	if exec.Command("python3", "-c", "import httpx").Run() == nil {
+		script := `
+import httpx, sys
+def body():
+    chunk = b"x" * (1 << 20)
+    for _ in range(64):
+        yield chunk
+try:
+    r = httpx.post(sys.argv[1], content=body(), headers={"Expect": "100-continue"}, timeout=30)
+    print("httpx status", r.status_code, r.text[:60])
+except Exception as e:
+    print("httpx exception", type(e).__name__)
+`
+		out, _ := exec.Command("python3", "-c", script, url).CombinedOutput()
+		t.Logf("python httpx with Expect header set: %s", strings.TrimSpace(string(out)))
+	}
 }
 
 // rootWrapper installs a git wrapper in a root-owned directory and returns its
@@ -838,4 +855,21 @@ func TestNonRootExecd(t *testing.T) {
 	require.Contains(t, do(r, http.MethodGet, "/v1/git/capabilities", nil).Body.String(), `"enabled":true`)
 	t.Setenv(gitRunAsEnv, "4242:4242")
 	require.Contains(t, do(r, http.MethodGet, "/v1/git/capabilities", nil).Body.String(), `"enabled":false`)
+}
+
+func TestPointRefAtExistingObject(t *testing.T) {
+	root := env(t)
+	sb := newRepo(t, root, "sandbox")
+	head := git(t, sb, "rev-parse", "HEAD")
+	r := gitRouter()
+	q := func(src, dst string) string { return "&ref=" + src + ":" + dst }
+
+	w := recv(r, sb, q(head, "refs/heads/copy"), nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Equal(t, head, git(t, sb, "rev-parse", "refs/heads/copy"))
+	// An unknown object, a dst outside the prefixes, and a ref source with no body are refused.
+	require.Equal(t, "GIT_PREREQUISITE_MISSING", codeOf(recv(r, sb, q(strings.Repeat("a", 40), "refs/heads/x"), nil)))
+	require.Equal(t, "GIT_REF_DENIED", codeOf(recv(r, sb, q(head, "refs/tags/v1"), nil)))
+	require.Equal(t, "GIT_BUNDLE_INVALID", codeOf(recv(r, sb, q("refs/heads/main", "refs/heads/y"), nil)))
+	require.Equal(t, http.StatusConflict, recv(r, sb, q(head, "refs/heads/main"), nil).Code, "checked-out branch")
 }

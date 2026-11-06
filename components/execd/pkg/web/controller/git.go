@@ -673,7 +673,7 @@ func (c *GitController) ReceiveBundle() {
 	var maps []refMapping
 	for _, s := range specs {
 		m, ok := parseMapping(s)
-		if !ok || !strings.HasPrefix(m.src, "refs/") || !strings.HasPrefix(m.dst, "refs/") ||
+		if !ok || !(strings.HasPrefix(m.src, "refs/") || gitObjectIDRe.MatchString(m.src)) || !strings.HasPrefix(m.dst, "refs/") ||
 			strings.ContainsAny(m.src+m.dst, "\x00\n \t") {
 			c.RespondError(http.StatusBadRequest, model.ErrorCodeInvalidRequest, "ref must be [+]<src>:<dst>[@<old-sha>]")
 			return
@@ -710,7 +710,7 @@ func (c *GitController) ReceiveBundle() {
 	}
 	defer r.Close()
 	for _, m := range maps {
-		if !validRefName(r, p, m.src) || !validRefName(r, p, m.dst) {
+		if (!gitObjectIDRe.MatchString(m.src) && !validRefName(r, p, m.src)) || !validRefName(r, p, m.dst) {
 			c.RespondError(http.StatusBadRequest, model.ErrorCodeInvalidRequest, "invalid ref name")
 			return
 		}
@@ -747,7 +747,30 @@ func (c *GitController) ReceiveBundle() {
 	// git bundle unbundle does not fsck, even with transfer.fsckObjects, so
 	// execd reads the bundle header itself and imports the pack through
 	// index-pack --strict.
-	heads, prereqs, herr := parseBundleHeader(stage)
+	size, _ := stage.Seek(0, io.SeekEnd)
+	_, _ = stage.Seek(0, io.SeekStart)
+	var heads map[string]string
+	var prereqs []string
+	var herr error
+	if size == 0 {
+		// No bundle: every source must be an object the repository already has.
+		heads = map[string]string{}
+		var in strings.Builder
+		for _, m := range maps {
+			if !gitObjectIDRe.MatchString(m.src) {
+				c.fail(gitErr(http.StatusUnprocessableEntity, codeBundleInvalid, "an empty body needs object IDs as sources"))
+				return
+			}
+			heads[m.src] = m.src
+			in.WriteString(m.src + "^{commit}\n")
+		}
+		if chk := r.git(ctx, p, strings.NewReader(in.String()), "cat-file", "--batch-check"); strings.Contains(chk.stdout, "missing") {
+			c.fail(gitErr(http.StatusUnprocessableEntity, codePrereqMissing, "the repository does not have that object"))
+			return
+		}
+		goto apply
+	}
+	heads, prereqs, herr = parseBundleHeader(stage)
 	if herr != nil {
 		c.fail(gitErr(http.StatusUnprocessableEntity, codeBundleInvalid, "bundle rejected: %s", herr.Error()))
 		return
@@ -773,6 +796,7 @@ func (c *GitController) ReceiveBundle() {
 		return
 	}
 
+apply:
 	checkedOut := map[string]bool{}
 	if wt := r.git(ctx, p, nil, "worktree", "list", "--porcelain"); wt.err == nil {
 		for _, line := range strings.Split(wt.stdout, "\n") {
