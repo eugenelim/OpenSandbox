@@ -277,3 +277,19 @@ func TestGitInitOnFirstPush(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, do(r, http.MethodPost, q(filepath.Join(root, "lnk", "x")), data).Code)
 	require.NoDirExists(t, filepath.Join(outside, "x"))
 }
+
+func TestGitLinkedWorktreeRejectedAndCapabilities(t *testing.T) {
+	root := gitEnv(t)
+	main := newRepo(t, root, "main")
+	wt := filepath.Join(root, "wt")
+	git(t, main, "worktree", "add", "-q", "-b", "side", wt)
+	r := gitRouter()
+	require.Equal(t, http.StatusNotFound, do(r, http.MethodGet, "/git/refs?path="+wt, nil).Code, "linked worktree has a .git file")
+	w := do(r, http.MethodGet, "/git/refs?path="+main, nil)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Contains(t, w.Body.String(), "refs/heads/side", "refs from a linked worktree are visible via the main tree")
+
+	w = do(r, http.MethodGet, "/git/capabilities", nil)
+	require.Contains(t, w.Body.String(), `"version":1`)
+	require.Contains(t, w.Body.String(), root)
+}
