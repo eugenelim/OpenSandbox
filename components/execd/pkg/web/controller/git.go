@@ -299,7 +299,7 @@ func openRepo(p gitPolicy, raw string) (*repo, *gitError) {
 		return nil, gitErr(http.StatusForbidden, codePathDenied, "path is not a main working tree (linked worktree or file .git)")
 	}
 	uid, gid, dev, ino := statIDs(gfi)
-	if why := gitBinaryUnsafe(); why != "" {
+	if why := gitUnusable(); why != "" {
 		return nil, gitErr(http.StatusNotImplemented, model.ErrorCodeNotSupported, "git transport is disabled: %s", why)
 	}
 	target := uid
@@ -987,15 +987,12 @@ func (c *GitController) Capabilities() {
 	if bin == "" {
 		bin = "git"
 	}
-	if why := gitBinaryUnsafe(); why != "" {
+	if why := gitUnusable(); why != "" {
 		c.RespondSuccess(gin.H{"enabled": false, "reason": why})
 		return
 	}
-	ver, err := exec.Command(bin, "--version").Output()
-	if err != nil {
-		c.RespondSuccess(gin.H{"enabled": false, "reason": "git binary not found"})
-		return
-	}
+	gp, _ := exec.LookPath(bin)
+	ver, _ := probeGit(gp, "--version")
 	if p.runAs != "" && os.Geteuid() != 0 {
 		if a, _, _ := strings.Cut(p.runAs, ":"); a != strconv.Itoa(os.Geteuid()) {
 			c.RespondSuccess(gin.H{"enabled": false, "reason": "execd cannot switch to the run_as identity"})
@@ -1147,7 +1144,7 @@ func gitBinaryUnsafe() string {
 	if why := writableChain(path); why != "" {
 		return why
 	}
-	if out, err := exec.Command(path, "--exec-path").Output(); err == nil {
+	if out, err := probeGit(path, "--exec-path"); err == nil {
 		return writableChain(strings.TrimSpace(string(out)))
 	}
 	return ""
@@ -1170,4 +1167,50 @@ func writableChain(p string) string {
 			return ""
 		}
 	}
+}
+
+// probeGit runs the already-verified binary with a scrubbed environment, so
+// execd's own variables (including its access token) never reach it.
+func probeGit(path string, args ...string) ([]byte, error) {
+	cmd := exec.Command(path, args...)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=/nonexistent", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "LC_ALL=C"}
+	return cmd.Output()
+}
+
+const minGitMajor, minGitMinor = 2, 34
+
+var gitVersionRe = regexp.MustCompile(`git version (\d+)\.(\d+)`)
+
+// gitTooOld reports why a version string is below the minimum, or "".
+func gitTooOld(version string) string {
+	m := gitVersionRe.FindStringSubmatch(version)
+	if m == nil {
+		return "cannot parse the git version"
+	}
+	major, _ := strconv.Atoi(m[1])
+	minor, _ := strconv.Atoi(m[2])
+	if major < minGitMajor || (major == minGitMajor && minor < minGitMinor) {
+		return fmt.Sprintf("git %d.%d is older than the supported minimum %d.%d", major, minor, minGitMajor, minGitMinor)
+	}
+	return ""
+}
+
+// gitUnusable combines the binary checks: safe path first, then version.
+func gitUnusable() string {
+	if why := gitBinaryUnsafe(); why != "" {
+		return why
+	}
+	bin := os.Getenv(gitBinEnv)
+	if bin == "" {
+		bin = "git"
+	}
+	path, err := exec.LookPath(bin)
+	if err != nil {
+		return "git binary not found"
+	}
+	out, err := probeGit(path, "--version")
+	if err != nil {
+		return "git binary not found"
+	}
+	return gitTooOld(string(out))
 }

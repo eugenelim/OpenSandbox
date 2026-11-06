@@ -873,3 +873,26 @@ func TestPointRefAtExistingObject(t *testing.T) {
 	require.Equal(t, "GIT_BUNDLE_INVALID", codeOf(recv(r, sb, q("refs/heads/main", "refs/heads/y"), nil)))
 	require.Equal(t, http.StatusConflict, recv(r, sb, q(head, "refs/heads/main"), nil).Code, "checked-out branch")
 }
+
+func TestGitVersionMinimumAndProbeEnvironment(t *testing.T) {
+	require.Contains(t, gitTooOld("git version 2.25.1"), "older than")
+	require.Equal(t, "", gitTooOld("git version 2.34.1"))
+	require.Equal(t, "", gitTooOld("git version 2.47.3"))
+	require.Equal(t, "", gitTooOld("git version 3.0.0"))
+	require.Contains(t, gitTooOld("garbage"), "cannot parse")
+
+	root := env(t)
+	sb := newRepo(t, root, "sandbox")
+	t.Setenv("EXECD_ACCESS_TOKEN", "secret-token-value")
+	seen := filepath.Join(root, "probe-env")
+	t.Setenv(gitBinEnv, rootWrapper(t, `case "$1" in --version|--exec-path) env >> `+seen+`;; esac`))
+	r := gitRouter()
+	w := do(r, http.MethodGet, "/v1/git/capabilities", nil)
+	require.Contains(t, w.Body.String(), `"enabled":true`, w.Body.String())
+	do(r, http.MethodGet, "/v1/git/refs?path="+sb, nil)
+	b, err := os.ReadFile(seen)
+	require.NoError(t, err, "the probes must have run the wrapper")
+	require.NotEmpty(t, string(b))
+	require.NotContains(t, string(b), "secret-token-value", "execd's environment must not reach the probes")
+	require.NotContains(t, string(b), "EXECD_ACCESS_TOKEN")
+}
