@@ -19,6 +19,7 @@ package controller
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -496,4 +497,170 @@ func TestCorruptObjectRejectedByFsck(t *testing.T) {
 	require.Equal(t, http.StatusUnprocessableEntity, w.Code, "malformed commit must be rejected on import: "+w.Body.String())
 	require.Equal(t, "GIT_BUNDLE_INVALID", codeOf(w))
 	require.Error(t, exec.Command("git", "-C", sb, "-c", "safe.directory=*", "rev-parse", "-q", "--verify", "refs/heads/bad").Run())
+}
+
+func TestStrictOwnershipChecks(t *testing.T) {
+	root := env(t)
+	r := gitRouter()
+	mk := func(name string) string { return newRepo(t, root, name) }
+	get := func(d string) *httptest.ResponseRecorder { return do(r, http.MethodGet, "/v1/git/refs?path="+d, nil) }
+
+	d := mk("group-writable")
+	require.NoError(t, os.Chmod(filepath.Join(d, ".git", "config"), 0o664))
+	w := get(d)
+	require.Equal(t, http.StatusForbidden, w.Code)
+	require.Equal(t, "GIT_PATH_DENIED", codeOf(w))
+
+	d = mk("include")
+	git(t, d, "config", "include.path", "/etc/hostname")
+	own(t, d)
+	require.Equal(t, "GIT_PATH_DENIED", codeOf(get(d)))
+	d = mk("includeif")
+	git(t, d, "config", "includeIf.gitdir:/x/.path", "/etc/hostname")
+	own(t, d)
+	require.Equal(t, "GIT_PATH_DENIED", codeOf(get(d)))
+
+	d = mk("config-worktree")
+	require.NoError(t, os.WriteFile(filepath.Join(d, ".git", "config.worktree"), []byte("[core]\n"), 0o666))
+	require.NoError(t, os.Chmod(filepath.Join(d, ".git", "config.worktree"), 0o666))
+	own(t, d)
+	require.Equal(t, "GIT_PATH_DENIED", codeOf(get(d)), "config.worktree is read when extensions.worktreeConfig is set")
+
+	// A repository owned by uid 0 needs an explicit run_as of 0:0.
+	d = filepath.Join(root, "rootowned")
+	require.NoError(t, os.MkdirAll(d, 0o755))
+	git(t, d, "init", "-q", "-b", "main")
+	require.NoError(t, exec.Command("chown", "-R", "0:0", d).Run())
+	w = get(d)
+	require.Equal(t, "GIT_PATH_DENIED", codeOf(w), w.Body.String())
+	t.Setenv(gitRunAsEnv, "0:0")
+	require.Equal(t, http.StatusOK, get(d).Code)
+}
+
+func TestRefNameAndQueryLimits(t *testing.T) {
+	root := env(t)
+	sb := newRepo(t, root, "sandbox")
+	r := gitRouter()
+	name := func(c byte, n int) string { return "refs/heads/" + strings.Repeat(string(c), n-len("refs/heads/")) }
+	lease := strings.Repeat("a", 40)
+
+	// 64 mappings with 200-byte names: the longest form the limit allows.
+	var q strings.Builder
+	for i := 0; i < 64; i++ {
+		src := name('s', 200)
+		dst := name('d', 200)
+		q.WriteString("&ref=%2B" + src + ":" + dst + "@" + lease)
+	}
+	url := "/v1/git/bundle/receive?path=" + sb + q.String()
+	require.Less(t, len(url), 32<<10, "64 mappings of 200-byte refs must fit in the 32 KiB query limit")
+	w := do(r, http.MethodPost, url, []byte("x"))
+	require.NotEqual(t, http.StatusRequestURITooLong, w.Code)
+	require.NotContains(t, w.Body.String(), "query too long")
+
+	// A 201-byte name is refused.
+	w = recv(r, sb, "&ref="+name('s', 201)+":"+name('d', 100), []byte("x"))
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+
+	// A query over 32 KiB is refused with 414.
+	long := "/v1/git/bundle/receive?path=" + sb + "&" + strings.Repeat("x=y&", 9000)
+	require.Equal(t, http.StatusRequestURITooLong, do(r, http.MethodPost, long, []byte("x")).Code)
+}
+
+func TestErrorMessagesDoNotLeakPaths(t *testing.T) {
+	root := env(t)
+	sb := newRepo(t, root, "sandbox")
+	client := newRepo(t, root, "client")
+	tree := git(t, client, "rev-parse", "HEAD^{tree}")
+	cmd := exec.Command("git", "-C", client, "-c", "safe.directory=*", "hash-object", "-t", "commit", "-w", "--literally", "--stdin")
+	cmd.Stdin = strings.NewReader("tree " + tree + "\nauthor bad\ncommitter t <t@t> 0 +0000\n\nbad\n")
+	out, err := cmd.Output()
+	require.NoError(t, err)
+	git(t, client, "update-ref", "refs/heads/bad", strings.TrimSpace(string(out)))
+	w := recv(gitRouter(), sb, "&ref=refs/heads/bad:refs/heads/bad", bundleOf(t, client, "refs/heads/bad"))
+	require.Equal(t, "GIT_BUNDLE_INVALID", codeOf(w))
+	require.NotContains(t, w.Body.String(), root, "no repository or staging path in an error body")
+	require.NotContains(t, w.Body.String(), "/proc/self/fd")
+}
+
+// While a body is being uploaded the staged bytes exist only as an unlinked
+// descriptor: no file name in the temp directory, and a process running as the
+// agent uid cannot read them through /proc.
+func TestStagingIsInvisibleToTheAgent(t *testing.T) {
+	root := env(t)
+	sb := newRepo(t, root, "sandbox")
+	srv := httptest.NewServer(gitRouter())
+	defer srv.Close()
+	const marker = "STAGED-MARKER-0123456789"
+
+	pr, pw := io.Pipe()
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/git/bundle/receive?path="+sb+"&ref=refs/heads/x:refs/heads/x", pr)
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	_, err = pw.Write([]byte(marker))
+	require.NoError(t, err)
+	time.Sleep(400 * time.Millisecond)
+
+	entries, _ := os.ReadDir(os.TempDir())
+	for _, e := range entries {
+		require.False(t, strings.HasPrefix(e.Name(), "execd-git-"), "staging file visible by name: %s", e.Name())
+	}
+
+	// Control: root can read the staged bytes through the unlinked descriptor.
+	found := false
+	fds, _ := os.ReadDir("/proc/self/fd")
+	for _, fd := range fds {
+		target, err := os.Readlink("/proc/self/fd/" + fd.Name())
+		if err != nil || !strings.HasSuffix(target, " (deleted)") {
+			continue
+		}
+		if b, err := os.ReadFile("/proc/self/fd/" + fd.Name()); err == nil && strings.Contains(string(b), marker) {
+			found = true
+		}
+	}
+	require.True(t, found, "control: the marker must be present in an unlinked staging descriptor")
+
+	script := `for f in /proc/` + strconv.Itoa(os.Getpid()) + `/fd/*; do case "$(readlink "$f" 2>/dev/null)" in *"(deleted)") cat "$f" 2>/dev/null;; esac; done`
+	out, _ := exec.Command("setpriv", "--reuid=1000", "--regid=1000", "--clear-groups", "sh", "-c", script).CombinedOutput()
+	require.NotContains(t, string(out), marker, "the agent uid must not read staged bytes")
+
+	_ = pw.Close()
+	<-done
+}
+
+// A client that sends Expect: 100-continue gets the 429 before uploading; the
+// run also records what happens without it.
+func TestExpectContinueGetsCleanBusy(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl not found")
+	}
+	root := env(t)
+	sb := newRepo(t, root, "sandbox")
+	srv := httptest.NewServer(gitRouter())
+	defer srv.Close()
+	rp, gerr := openRepo(loadGitPolicy(), sb)
+	require.Nil(t, gerr)
+	require.True(t, acquireGit(rp.key, 2))
+	defer func() { releaseGit(rp.key); rp.Close() }()
+
+	big := filepath.Join(root, "big.bin")
+	require.NoError(t, os.WriteFile(big, make([]byte, 64<<20), 0o644))
+	url := srv.URL + "/v1/git/bundle/receive?path=" + sb + "&ref=refs/heads/x:refs/heads/x"
+	run := func(expect string) (string, string) {
+		out, _ := exec.Command("curl", "-s", "-o", "/dev/stdout", "-w", "\nSTATUS=%{http_code} SENT=%{size_upload}", "-X", "POST", "-H", "Expect: "+expect, "--data-binary", "@"+big, url).CombinedOutput()
+		s := string(out)
+		return s[strings.LastIndex(s, "STATUS="):], s
+	}
+	withExpect, body := run("100-continue")
+	t.Logf("with Expect: %s", withExpect)
+	require.Contains(t, withExpect, "STATUS=429")
+	require.Contains(t, body, "GIT_BUSY")
+	require.Contains(t, withExpect, "SENT=0", "the body must not be uploaded before the decision")
+	without, _ := run("")
+	t.Logf("without Expect: %s", without)
 }

@@ -28,6 +28,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -63,6 +65,17 @@ const (
 )
 
 var gitObjectIDRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+var includeRe = regexp.MustCompile(`(?im)^\s*\[\s*include(if)?[\s"\]]`)
+
+const maxRefNameBytes = 200
+
+func runAsOf(p gitPolicy) string {
+	if p.runAs != "" {
+		return p.runAs
+	}
+	return "x:x"
+}
 
 type gitPolicy struct {
 	repoRoot string
@@ -266,17 +279,32 @@ func openRepo(p gitPolicy, raw string) (*repo, *gitError) {
 		return nil, gitErr(http.StatusForbidden, codePathDenied, "path is not a main working tree (linked worktree or file .git)")
 	}
 	uid, gid, dev, ino := statIDs(gfi)
-	for _, name := range []string{"objects", "refs", "HEAD", "config", "hooks"} {
-		fi, err := dir.Lstat(".git/" + name)
+	if uid == 0 && !strings.HasPrefix(runAsOf(p), "0:") {
+		return nil, gitErr(http.StatusForbidden, codePathDenied, "repository is owned by uid 0; set run_as to 0:0 to allow")
+	}
+	// Every entry directly under .git other than the contents of objects and
+	// refs must belong to the target uid and not be group or other writable.
+	entries, err := fs.ReadDir(dir.FS(), ".git")
+	if err != nil {
+		return nil, gitErr(http.StatusForbidden, codePathDenied, "cannot read .git")
+	}
+	for _, e := range entries {
+		fi, err := dir.Lstat(".git/" + e.Name())
 		if err != nil {
 			continue
 		}
-		if isSymlink(fi) {
-			return nil, gitErr(http.StatusForbidden, codePathDenied, ".git/%s is a symlink", name)
+		if isSymlink(fi) && (e.Name() == "objects" || e.Name() == "refs" || e.Name() == "HEAD") {
+			return nil, gitErr(http.StatusForbidden, codePathDenied, ".git/%s is a symlink", e.Name())
 		}
 		if u, g, _, _ := statIDs(fi); u != uid || g != gid {
-			return nil, gitErr(http.StatusForbidden, codePathDenied, "mixed ownership under .git")
+			return nil, gitErr(http.StatusForbidden, codePathDenied, "mixed ownership under .git: %s", e.Name())
 		}
+		if fi.Mode().Perm()&0o022 != 0 && !isSymlink(fi) {
+			return nil, gitErr(http.StatusForbidden, codePathDenied, ".git/%s is group or other writable", e.Name())
+		}
+	}
+	if cfg, err := dir.ReadFile(".git/config"); err == nil && includeRe.Match(cfg) {
+		return nil, gitErr(http.StatusForbidden, codePathDenied, ".git/config has an include section")
 	}
 	for _, name := range []string{"commondir", "objects/info/alternates", "info/grafts", "shallow"} {
 		if _, err := dir.Lstat(".git/" + name); err == nil {
@@ -401,7 +429,7 @@ func staging() (*os.File, error) {
 }
 
 func validRefName(r *repo, p gitPolicy, ref string) bool {
-	if !strings.HasPrefix(ref, "refs/") || strings.ContainsAny(ref, "\x00\n \t") {
+	if len(ref) > maxRefNameBytes || !strings.HasPrefix(ref, "refs/") || strings.ContainsAny(ref, "\x00\n \t") {
 		return false
 	}
 	res := r.git(context.Background(), p, nil, "check-ref-format", ref)
@@ -433,7 +461,8 @@ func (c *GitController) ListRefs() {
 	prefixes := c.ctx.QueryArray("prefix")
 	res := r.git(c.ctx.Request.Context(), p, nil, "for-each-ref", "--format=%(objectname) %(refname)")
 	if res.err != nil {
-		c.RespondError(http.StatusInternalServerError, model.ErrorCodeRuntimeError, res.stderr)
+		log.Printf("git for-each-ref failed: %s", res.stderr)
+		c.RespondError(http.StatusInternalServerError, model.ErrorCodeRuntimeError, "git operation failed")
 		return
 	}
 	refs := []gitRef{}
@@ -554,7 +583,8 @@ func (c *GitController) CreateBundle() {
 			c.ctx.Status(http.StatusNoContent)
 			return
 		}
-		c.RespondError(http.StatusInternalServerError, model.ErrorCodeRuntimeError, runErr.Error()+": "+strings.TrimSpace(errb.String()))
+		log.Printf("git bundle create failed: %v: %s", runErr, strings.TrimSpace(errb.String()))
+		c.RespondError(http.StatusInternalServerError, model.ErrorCodeRuntimeError, "git operation failed")
 		return
 	}
 	size, _ := stage.Seek(0, io.SeekEnd)
@@ -598,7 +628,7 @@ type gitRefUpdate struct {
 func (c *GitController) ReceiveBundle() {
 	p := loadGitPolicy()
 	raw := c.ctx.Query("path")
-	if len(c.ctx.Request.URL.RawQuery) > 8<<10 {
+	if len(c.ctx.Request.URL.RawQuery) > 32<<10 {
 		c.RespondError(http.StatusRequestURITooLong, model.ErrorCodeInvalidRequest, "query too long")
 		return
 	}
@@ -689,7 +719,8 @@ func (c *GitController) ReceiveBundle() {
 		}
 	}
 	if res := r.git(ctx, p, stage, "index-pack", "--stdin", "--fix-thin", "--strict"); res.err != nil {
-		c.fail(gitErr(http.StatusUnprocessableEntity, codeBundleInvalid, "bundle rejected: %s", res.stderr))
+		log.Printf("index-pack rejected bundle: %s", res.stderr)
+		c.fail(gitErr(http.StatusUnprocessableEntity, codeBundleInvalid, "bundle rejected: objects failed verification"))
 		return
 	}
 
@@ -740,11 +771,14 @@ func (c *GitController) ReceiveBundle() {
 	if up := r.git(ctx, p, strings.NewReader(tx.String()), "update-ref", "--stdin"); up.err != nil {
 		switch {
 		case strings.Contains(up.stderr, ".lock") || strings.Contains(up.stderr, "cannot lock"):
-			c.fail(gitErr(http.StatusConflict, codeRefLocked, "ref is locked: %s", up.stderr))
+			log.Printf("update-ref lock failure: %s", up.stderr)
+			c.fail(gitErr(http.StatusConflict, codeRefLocked, "a ref is locked"))
 		case strings.Contains(up.stderr, "expected"):
-			c.fail(gitErr(http.StatusConflict, codeStaleLease, "ref moved during update: %s", up.stderr))
+			log.Printf("update-ref stale: %s", up.stderr)
+			c.fail(gitErr(http.StatusConflict, codeStaleLease, "a ref moved during the update"))
 		default:
-			c.RespondError(http.StatusInternalServerError, model.ErrorCodeRuntimeError, up.stderr)
+			log.Printf("update-ref failed: %s", up.stderr)
+			c.RespondError(http.StatusInternalServerError, model.ErrorCodeRuntimeError, "git operation failed")
 		}
 		return
 	}
