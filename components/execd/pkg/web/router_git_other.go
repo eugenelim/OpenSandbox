@@ -12,27 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !windows
+//go:build !linux
 
-package controller
+package web
 
-import (
-	"os"
-	"syscall"
-)
+import "github.com/gin-gonic/gin"
 
-// chownToRepoOwner hands a staging path to the repository owner so the
-// de-privileged git process can read and write it.
-func chownToRepoOwner(path, repo string) error {
-	if os.Geteuid() != 0 {
-		return nil
-	}
-	fi, err := os.Stat(repo)
-	if err != nil {
-		return err
-	}
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Uid != 0 {
-		return os.Chown(path, int(st.Uid), int(st.Gid))
-	}
-	return nil
-}
+func registerGitRoutes(r *gin.Engine) {}

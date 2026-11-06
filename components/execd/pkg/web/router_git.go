@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !windows
+//go:build linux
 
 package web
 
@@ -23,7 +23,7 @@ import (
 )
 
 func registerGitRoutes(r *gin.Engine) {
-	git := r.Group("/git")
+	git := r.Group("/v1/git")
 	{
 		git.GET("/capabilities", func(c *gin.Context) { controller.NewGitController(c).Capabilities() })
 		git.GET("/refs", func(c *gin.Context) { controller.NewGitController(c).ListRefs() })
