@@ -380,7 +380,7 @@ func TestWorktreesAndInit(t *testing.T) {
 	commit(t, client, "s")
 	b := bundleOf(t, client, "refs/heads/side2")
 	w := recv(r, mainRepo, "&ref=refs/heads/side2:refs/heads/side", b)
-	require.Equal(t, "GIT_REF_CHECKED_OUT", codeOf(w), "branch checked out in a linked worktree")
+	require.Equal(t, "GIT_REF_CHECKED_OUT", codeOf(w), "branch checked out in a linked worktree: "+w.Body.String())
 
 	// init: first push lands on its branch, second push to it is checked-out.
 	bm := bundleOf(t, client, "refs/heads/main")
@@ -393,6 +393,8 @@ func TestWorktreesAndInit(t *testing.T) {
 	require.Equal(t, uint32(agentUID), st.Sys().(*syscall.Stat_t).Uid)
 	git(t, target, "reset", "-q", "--hard")
 	require.FileExists(t, filepath.Join(target, "a.txt"))
+	// The test runs git as root, so hand the files back to the agent, as the agent's own git would have written them.
+	own(t, target)
 	require.Equal(t, "GIT_REF_CHECKED_OUT", codeOf(recv(r, target, "&ref=refs/heads/main:refs/heads/main", bm)))
 	require.Equal(t, "GIT_INIT_TARGET_NOT_EMPTY", codeOf(recv(r, target, "&init=true&ref=refs/heads/main:refs/heads/main", bm)))
 	outside := t.TempDir()
