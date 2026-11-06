@@ -154,8 +154,7 @@ func TestRoundTripAndIdentityDrop(t *testing.T) {
 
 	// A wrapper records the uid git runs as, then execs the real binary.
 	marker := filepath.Join(root, "uid")
-	wrapper := filepath.Join(root, "git-wrapper")
-	require.NoError(t, os.WriteFile(wrapper, []byte("#!/bin/sh\nid -u >> "+marker+"\nexec /usr/bin/git \"$@\"\n"), 0o755))
+	wrapper := rootWrapper(t, `echo "$(id -u) $*" >> `+marker)
 	t.Setenv(gitBinEnv, wrapper)
 	require.NoError(t, os.WriteFile(marker, nil, 0o666))
 	require.NoError(t, os.Chmod(marker, 0o666))
@@ -188,11 +187,16 @@ func TestRoundTripAndIdentityDrop(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	require.Equal(t, newTip, git(t, sb, "rev-parse", "refs/heads/feature"))
 
-	uids, _ := os.ReadFile(marker)
-	require.NotEmpty(t, strings.TrimSpace(string(uids)))
-	for _, u := range strings.Fields(string(uids)) {
-		require.Equal(t, strconv.Itoa(agentUID), u, "git must never run as execd's uid")
+	log, _ := os.ReadFile(marker)
+	repoOps := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(log)), "\n") {
+		uid, args, _ := strings.Cut(line, " ")
+		if strings.Contains(args, "--git-dir=") { // a repository operation, not execd's own --version or --exec-path probe
+			repoOps++
+			require.Equal(t, strconv.Itoa(agentUID), uid, "git must never run as execd's uid: %s", line)
+		}
 	}
+	require.Greater(t, repoOps, 3)
 }
 
 func TestOwnershipAndPaths(t *testing.T) {
@@ -665,4 +669,173 @@ func TestExpectContinueGetsCleanBusy(t *testing.T) {
 	require.Contains(t, withExpect, "SENT=0", "the body must not be uploaded before the decision")
 	without, _ := run("")
 	t.Logf("without Expect: %s", without)
+}
+
+// rootWrapper installs a git wrapper in a root-owned directory and returns its
+// path. The body runs before the real git.
+func rootWrapper(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join("/usr/local/bin", "gt-wrapper-"+strconv.Itoa(int(time.Now().UnixNano()%1000000000)))
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\nexec /usr/bin/git \"$@\"\n"), 0o755))
+	t.Cleanup(func() { _ = os.Remove(path) })
+	return path
+}
+
+func TestGitBinarySafety(t *testing.T) {
+	root := env(t)
+	sb := newRepo(t, root, "sandbox")
+	unsafe := filepath.Join(root, "git-wrapper") // directory owned by the agent uid
+	require.NoError(t, os.WriteFile(unsafe, []byte("#!/bin/sh\nexec /usr/bin/git \"$@\"\n"), 0o755))
+	t.Setenv(gitBinEnv, unsafe)
+	r := gitRouter()
+	w := do(r, http.MethodGet, "/v1/git/capabilities", nil)
+	require.Contains(t, w.Body.String(), `"enabled":false`)
+	require.Contains(t, w.Body.String(), "writable by a non-root user")
+	require.Equal(t, http.StatusNotImplemented, do(r, http.MethodGet, "/v1/git/refs?path="+sb, nil).Code)
+	t.Setenv(gitBinEnv, "")
+	require.Contains(t, do(r, http.MethodGet, "/v1/git/capabilities", nil).Body.String(), `"enabled":true`)
+}
+
+func TestReplayAndRaceCodes(t *testing.T) {
+	root := env(t)
+	sb := newRepo(t, root, "sandbox")
+	base := git(t, sb, "rev-parse", "HEAD")
+	client := newRepo(t, root, "client")
+	git(t, client, "fetch", "-q", sb, "main:refs/heads/base")
+	git(t, client, "checkout", "-q", "-b", "feature")
+	tip := commit(t, client, "f1")
+	b := bundleOf(t, client, "refs/heads/feature", "^"+base)
+	r := gitRouter()
+	q := "&ref=refs/heads/feature:refs/heads/f"
+
+	require.Equal(t, http.StatusOK, recv(r, sb, q, b).Code)
+	// Replaying a completed fast-forward reports old equal to new.
+	w := recv(r, sb, q, b)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), `"old":"`+tip+`"`)
+	require.Contains(t, w.Body.String(), `"new":"`+tip+`"`)
+
+	// The agent moves the ref between execd's checks and the transaction.
+	git(t, sb, "update-ref", "-d", "refs/heads/f")
+	var agentTip string
+	testBeforeTransaction = func() {
+		git(t, sb, "update-ref", "refs/heads/f", base)
+		own(t, sb) // the agent's own git would have written these files as the agent
+		agentTip = base
+	}
+	defer func() { testBeforeTransaction = nil }()
+	w = recv(r, sb, q, b)
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.Equal(t, "GIT_NOT_FAST_FORWARD", codeOf(w), "unleased mapping: "+w.Body.String())
+	require.Equal(t, agentTip, git(t, sb, "rev-parse", "refs/heads/f"), "the agent's move must stand")
+	// Same race with a lease: f points at base when execd checks the lease,
+	// then the agent moves it to a new commit before the transaction.
+	other := commit(t, sb, "agent2")
+	testBeforeTransaction = func() {
+		git(t, sb, "update-ref", "refs/heads/f", other)
+		own(t, sb)
+	}
+	w = recv(r, sb, "&ref=refs/heads/feature:refs/heads/f@"+base, b)
+	require.Equal(t, "GIT_STALE_LEASE", codeOf(w), "leased mapping: "+w.Body.String())
+	require.Equal(t, other, git(t, sb, "rev-parse", "refs/heads/f"), "the agent's move must stand")
+}
+
+func TestConcurrentInitSerializes(t *testing.T) {
+	root := env(t)
+	client := newRepo(t, root, "client")
+	b := bundleOf(t, client, "refs/heads/main")
+	r := gitRouter()
+	target := filepath.Join(root, "fresh")
+	testBeforeTransaction = func() { time.Sleep(500 * time.Millisecond) }
+	defer func() { testBeforeTransaction = nil }()
+	codes := make(chan int, 2)
+	start := make(chan struct{})
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			codes <- recv(r, target, "&init=true&ref=refs/heads/main:refs/heads/main", b).Code
+		}()
+	}
+	close(start)
+	a, c := <-codes, <-codes
+	ok := 0
+	for _, code := range []int{a, c} {
+		if code == http.StatusOK {
+			ok++
+		} else {
+			require.Contains(t, []int{http.StatusTooManyRequests, http.StatusConflict}, code)
+		}
+	}
+	require.Equal(t, 1, ok, "exactly one concurrent init may win, got %d and %d", a, c)
+}
+
+func TestTimeoutKillsProcessGroup(t *testing.T) {
+	root := env(t)
+	sb := newRepo(t, root, "sandbox")
+	client := newRepo(t, root, "client")
+	git(t, client, "checkout", "-q", "-b", "feature")
+	commit(t, client, "f1")
+	b := bundleOf(t, client, "refs/heads/feature")
+	t.Setenv(gitTimeoutEnv, "1")
+	t.Setenv(gitBinEnv, rootWrapper(t, `case "$*" in *index-pack*) exec sleep 31;; esac`))
+	start := time.Now()
+	w := recv(gitRouter(), sb, "&ref=refs/heads/feature:refs/heads/f", b)
+	require.Equal(t, http.StatusGatewayTimeout, w.Code, w.Body.String())
+	require.Equal(t, "GIT_TIMEOUT", codeOf(w))
+	require.Less(t, time.Since(start), 5*time.Second)
+	time.Sleep(300 * time.Millisecond)
+	procs, _ := os.ReadDir("/proc")
+	for _, e := range procs {
+		if cmd, err := os.ReadFile("/proc/" + e.Name() + "/cmdline"); err == nil {
+			require.NotContains(t, string(cmd), "sleep\x0031", "the timed-out git process group must be gone")
+		}
+	}
+	require.Error(t, exec.Command("git", "-C", sb, "-c", "safe.directory=*", "rev-parse", "-q", "--verify", "refs/heads/f").Run(), "no ref after a timeout")
+}
+
+func TestStalledUploadIsCut(t *testing.T) {
+	root := env(t)
+	sb := newRepo(t, root, "sandbox")
+	t.Setenv(gitMinWindowEnv, "1")
+	srv := httptest.NewServer(gitRouter())
+	defer srv.Close()
+	pr, pw := io.Pipe()
+	go func() {
+		for i := 0; i < 12; i++ {
+			if _, err := pw.Write([]byte("x")); err != nil {
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		_ = pw.Close()
+	}()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/git/bundle/receive?path="+sb+"&ref=refs/heads/x:refs/heads/x", pr)
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusRequestTimeout, resp.StatusCode, string(body))
+	require.Contains(t, string(body), "GIT_UPLOAD_STALLED")
+	require.Less(t, time.Since(start), 2500*time.Millisecond, "cut near the window, not at the end of the trickle")
+}
+
+// Run as a non-root execd by the container script: GT_NONROOT_DIR holds one
+// repository owned by this uid and one owned by another.
+func TestNonRootExecd(t *testing.T) {
+	dir := os.Getenv("GT_NONROOT_DIR")
+	if dir == "" || os.Geteuid() == 0 {
+		t.Skip("runs only as a non-root process with GT_NONROOT_DIR set")
+	}
+	for _, k := range []string{gitInboundEnv, gitOutboundEnv, gitMaxBundleEnv, gitRunAsEnv, gitBinEnv, gitTimeoutEnv, gitMaxConcEnv, gitUnsafeTestEnv} {
+		t.Setenv(k, "")
+	}
+	t.Setenv(gitRepoRootEnv, dir)
+	r := gitRouter()
+	require.Equal(t, http.StatusOK, do(r, http.MethodGet, "/v1/git/refs?path="+filepath.Join(dir, "own"), nil).Code, "own repository works without switching identity")
+	w := do(r, http.MethodGet, "/v1/git/refs?path="+filepath.Join(dir, "foreign"), nil)
+	require.Equal(t, http.StatusNotImplemented, w.Code, w.Body.String())
+	require.Contains(t, do(r, http.MethodGet, "/v1/git/capabilities", nil).Body.String(), `"enabled":true`)
+	t.Setenv(gitRunAsEnv, "4242:4242")
+	require.Contains(t, do(r, http.MethodGet, "/v1/git/capabilities", nil).Body.String(), `"enabled":false`)
 }

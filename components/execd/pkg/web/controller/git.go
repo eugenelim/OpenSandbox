@@ -57,6 +57,8 @@ const (
 	gitTimeoutEnv    = "EXECD_GIT_TIMEOUT_SECONDS"
 	gitMaxConcEnv    = "EXECD_GIT_MAX_CONCURRENT"
 	gitUnsafeTestEnv = "EXECD_GIT_UNSAFE_FOR_TEST" // negative control only
+	gitMinRateEnv    = "EXECD_GIT_MIN_UPLOAD_BPS"
+	gitMinWindowEnv  = "EXECD_GIT_MIN_UPLOAD_WINDOW_SECONDS"
 
 	gitDefaultInbound  = "refs/heads/"
 	gitDefaultOutbound = "refs/heads/,refs/tags/"
@@ -85,6 +87,8 @@ type gitPolicy struct {
 	runAs    string
 	timeout  time.Duration
 	maxConc  int
+	minRate  int64
+	minWin   time.Duration
 }
 
 func loadGitPolicy() gitPolicy {
@@ -108,12 +112,20 @@ func loadGitPolicy() gitPolicy {
 		runAs:    os.Getenv(gitRunAsEnv),
 		timeout:  300 * time.Second,
 		maxConc:  2,
+		minRate:  64 << 10,
+		minWin:   30 * time.Second,
 	}
 	if v, err := strconv.ParseInt(os.Getenv(gitMaxBundleEnv), 10, 64); err == nil && v > 0 {
 		p.maxBytes = v
 	}
 	if v, err := strconv.Atoi(os.Getenv(gitTimeoutEnv)); err == nil && v > 0 {
 		p.timeout = time.Duration(v) * time.Second
+	}
+	if v, err := strconv.ParseInt(os.Getenv(gitMinRateEnv), 10, 64); err == nil && v > 0 {
+		p.minRate = v
+	}
+	if v, err := strconv.Atoi(os.Getenv(gitMinWindowEnv)); err == nil && v > 0 {
+		p.minWin = time.Duration(v) * time.Second
 	}
 	if v, err := strconv.Atoi(os.Getenv(gitMaxConcEnv)); err == nil && v > 0 {
 		p.maxConc = v
@@ -176,6 +188,12 @@ func gitErr(status int, code model.ErrorCode, format string, a ...any) *gitError
 }
 
 func (c *GitController) fail(err *gitError) {
+	switch err.status {
+	case http.StatusRequestTimeout, http.StatusRequestEntityTooLarge, http.StatusTooManyRequests:
+		// Without this the Go server drains an unread request body (up to
+		// 256 KiB) before it sends the response, which a slow client can stall.
+		c.ctx.Header("Connection", "close")
+	}
 	if id := c.ctx.GetHeader("X-Request-ID"); id != "" {
 		c.ctx.Header("X-Request-ID", id)
 	}
@@ -195,6 +213,8 @@ const (
 	codePrereqMissing model.ErrorCode = "GIT_PREREQUISITE_MISSING"
 	codeBundleInvalid model.ErrorCode = "GIT_BUNDLE_INVALID"
 	codeBusy          model.ErrorCode = "GIT_BUSY"
+	codeUploadStalled model.ErrorCode = "GIT_UPLOAD_STALLED"
+	codeTimeout       model.ErrorCode = "GIT_TIMEOUT"
 )
 
 // repo is a resolved repository. gitdir is an open descriptor on <repo>/.git;
@@ -279,6 +299,19 @@ func openRepo(p gitPolicy, raw string) (*repo, *gitError) {
 		return nil, gitErr(http.StatusForbidden, codePathDenied, "path is not a main working tree (linked worktree or file .git)")
 	}
 	uid, gid, dev, ino := statIDs(gfi)
+	if why := gitBinaryUnsafe(); why != "" {
+		return nil, gitErr(http.StatusNotImplemented, model.ErrorCodeNotSupported, "git transport is disabled: %s", why)
+	}
+	target := uid
+	if p.runAs != "" {
+		a, _, _ := strings.Cut(p.runAs, ":")
+		if u, err := strconv.ParseUint(a, 10, 32); err == nil {
+			target = uint32(u)
+		}
+	}
+	if os.Geteuid() != 0 && uint32(os.Geteuid()) != target {
+		return nil, gitErr(http.StatusNotImplemented, model.ErrorCodeNotSupported, "git transport is disabled: execd cannot switch to the repository identity")
+	}
 	if uid == 0 && !strings.HasPrefix(runAsOf(p), "0:") {
 		return nil, gitErr(http.StatusForbidden, codePathDenied, "repository is owned by uid 0; set run_as to 0:0 to allow")
 	}
@@ -659,6 +692,14 @@ func (c *GitController) ReceiveBundle() {
 	var r *repo
 	var gerr *gitError
 	if c.ctx.Query("init") == "true" {
+		if k, ok := initKey(raw); ok {
+			if !tryLock(k) {
+				c.ctx.Header("Retry-After", "5")
+				c.fail(gitErr(http.StatusTooManyRequests, codeBusy, "another transfer is creating this repository"))
+				return
+			}
+			defer unlock(k)
+		}
 		r, gerr = initRepo(p, raw, maps[0].dst)
 	} else {
 		r, gerr = openRepo(p, raw)
@@ -687,8 +728,12 @@ func (c *GitController) ReceiveBundle() {
 		return
 	}
 	defer stage.Close()
-	body := http.MaxBytesReader(c.ctx.Writer, c.ctx.Request.Body, p.maxBytes)
+	body := &minRateReader{r: http.MaxBytesReader(c.ctx.Writer, c.ctx.Request.Body, p.maxBytes), start: time.Now(), min: p.minRate, window: p.minWin}
 	if _, err := io.Copy(stage, body); err != nil {
+		if errors.Is(err, errUploadStalled) {
+			c.fail(gitErr(http.StatusRequestTimeout, codeUploadStalled, "upload rate fell below the minimum"))
+			return
+		}
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			c.fail(gitErr(http.StatusRequestEntityTooLarge, codeTooLarge, "bundle exceeds the size cap"))
@@ -719,6 +764,10 @@ func (c *GitController) ReceiveBundle() {
 		}
 	}
 	if res := r.git(ctx, p, stage, "index-pack", "--stdin", "--fix-thin", "--strict"); res.err != nil {
+		if ctx.Err() != nil {
+			c.fail(gitErr(http.StatusGatewayTimeout, codeTimeout, "the transfer exceeded the time limit"))
+			return
+		}
 		log.Printf("index-pack rejected bundle: %s", res.stderr)
 		c.fail(gitErr(http.StatusUnprocessableEntity, codeBundleInvalid, "bundle rejected: objects failed verification"))
 		return
@@ -768,14 +817,36 @@ func (c *GitController) ReceiveBundle() {
 		updated = append(updated, u)
 	}
 	tx.WriteString("prepare\ncommit\n")
+	if testBeforeTransaction != nil {
+		testBeforeTransaction()
+	}
 	if up := r.git(ctx, p, strings.NewReader(tx.String()), "update-ref", "--stdin"); up.err != nil {
+		if ctx.Err() != nil {
+			c.fail(gitErr(http.StatusGatewayTimeout, codeTimeout, "the transfer exceeded the time limit"))
+			return
+		}
 		switch {
+		case strings.Contains(up.stderr, "but expected") || strings.Contains(up.stderr, "reference already exists"):
+			log.Printf("update-ref stale: %s", up.stderr)
+			code := codeNotFF
+			for _, m := range maps {
+				if m.lease != "" {
+					code = codeStaleLease
+				}
+			}
+			c.fail(gitErr(http.StatusConflict, code, "a ref moved during the update"))
 		case strings.Contains(up.stderr, ".lock") || strings.Contains(up.stderr, "cannot lock"):
 			log.Printf("update-ref lock failure: %s", up.stderr)
 			c.fail(gitErr(http.StatusConflict, codeRefLocked, "a ref is locked"))
 		case strings.Contains(up.stderr, "expected"):
 			log.Printf("update-ref stale: %s", up.stderr)
-			c.fail(gitErr(http.StatusConflict, codeStaleLease, "a ref moved during the update"))
+			code := codeNotFF
+			for _, m := range maps {
+				if m.lease != "" {
+					code = codeStaleLease
+				}
+			}
+			c.fail(gitErr(http.StatusConflict, code, "a ref moved during the update"))
 		default:
 			log.Printf("update-ref failed: %s", up.stderr)
 			c.RespondError(http.StatusInternalServerError, model.ErrorCodeRuntimeError, "git operation failed")
@@ -892,10 +963,20 @@ func (c *GitController) Capabilities() {
 	if bin == "" {
 		bin = "git"
 	}
+	if why := gitBinaryUnsafe(); why != "" {
+		c.RespondSuccess(gin.H{"enabled": false, "reason": why})
+		return
+	}
 	ver, err := exec.Command(bin, "--version").Output()
 	if err != nil {
 		c.RespondSuccess(gin.H{"enabled": false, "reason": "git binary not found"})
 		return
+	}
+	if p.runAs != "" && os.Geteuid() != 0 {
+		if a, _, _ := strings.Cut(p.runAs, ":"); a != strconv.Itoa(os.Geteuid()) {
+			c.RespondSuccess(gin.H{"enabled": false, "reason": "execd cannot switch to the run_as identity"})
+			return
+		}
 	}
 	c.RespondSuccess(gin.H{
 		"enabled": true, "version": 1, "repo_root": p.repoRoot, "object_format": "sha1",
@@ -957,4 +1038,112 @@ func parseBundleHeader(f *os.File) (heads map[string]string, prereqs []string, e
 		}
 	}
 	return nil, nil, errors.New("bundle header too long")
+}
+
+// testBeforeTransaction lets a test move a ref between execd's checks and the
+// ref transaction, standing in for an agent running its own git.
+var testBeforeTransaction func()
+
+// tryLock takes a key without counting against the global slots.
+func tryLock(key [2]uint64) bool {
+	gitLockMu.Lock()
+	defer gitLockMu.Unlock()
+	if gitLocks[key] {
+		return false
+	}
+	gitLocks[key] = true
+	return true
+}
+
+func unlock(key [2]uint64) {
+	gitLockMu.Lock()
+	defer gitLockMu.Unlock()
+	delete(gitLocks, key)
+}
+
+// initKey identifies a not-yet-existing target by its parent's device and
+// inode plus the final path component.
+func initKey(raw string) ([2]uint64, bool) {
+	expanded, err := pathutil.ExpandPath(raw)
+	if err != nil {
+		return [2]uint64{}, false
+	}
+	abs, err := filepath.Abs(expanded)
+	if err != nil {
+		return [2]uint64{}, false
+	}
+	fi, err := os.Stat(filepath.Dir(abs))
+	if err != nil {
+		return [2]uint64{}, false
+	}
+	_, _, dev, ino := statIDs(fi)
+	h := uint64(14695981039346656037)
+	for _, b := range []byte(filepath.Base(abs)) {
+		h = (h ^ uint64(b)) * 1099511628211
+	}
+	return [2]uint64{dev, ino ^ h}, true
+}
+
+// minRateReader ends an upload whose average rate stays under the minimum
+// once the window has elapsed.
+type minRateReader struct {
+	r      io.Reader
+	start  time.Time
+	n      int64
+	min    int64
+	window time.Duration
+}
+
+var errUploadStalled = errors.New("upload too slow")
+
+func (m *minRateReader) Read(b []byte) (int, error) {
+	n, err := m.r.Read(b)
+	m.n += int64(n)
+	if el := time.Since(m.start); el >= m.window && err == nil && float64(m.n)/el.Seconds() < float64(m.min) {
+		return n, errUploadStalled
+	}
+	return n, err
+}
+
+// gitBinaryUnsafe reports why the git binary cannot be trusted: it, its exec
+// path, or any parent must not be writable by anyone but root.
+func gitBinaryUnsafe() string {
+	if os.Geteuid() != 0 {
+		return ""
+	}
+	bin := os.Getenv(gitBinEnv)
+	if bin == "" {
+		bin = "git"
+	}
+	path, err := exec.LookPath(bin)
+	if err != nil {
+		return "git binary not found"
+	}
+	// The binary is checked before it is ever executed as root.
+	if why := writableChain(path); why != "" {
+		return why
+	}
+	if out, err := exec.Command(path, "--exec-path").Output(); err == nil {
+		return writableChain(strings.TrimSpace(string(out)))
+	}
+	return ""
+}
+
+func writableChain(p string) string {
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		p = real
+	}
+	for cur := p; ; cur = filepath.Dir(cur) {
+		fi, err := os.Stat(cur)
+		if err != nil {
+			return ""
+		}
+		uid, _, _, _ := statIDs(fi)
+		if uid != 0 || fi.Mode().Perm()&0o022 != 0 {
+			return "git binary path is writable by a non-root user: " + cur
+		}
+		if cur == "/" || cur == "." {
+			return ""
+		}
+	}
 }
