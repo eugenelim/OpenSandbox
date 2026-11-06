@@ -568,6 +568,8 @@ func (c *GitController) Capabilities() {
 	}
 	c.RespondSuccess(gin.H{
 		"enabled":          true,
+		"version":          1,
+		"repo_root":        p.repoRoot,
 		"git_version":      strings.TrimSpace(string(ver)),
 		"max_bundle_bytes": p.maxBytes,
 		"read_refs":        p.readRefs,
