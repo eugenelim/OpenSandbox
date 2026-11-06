@@ -11,4 +11,5 @@ What the prototype established, in the order it mattered:
 3. A bundle header can contain a `HEAD` line as well as `refs/` lines.
 4. A `+` in a query string decodes to a space unless it is sent as `%2B`.
 5. `os.Root` plus an `Lstat` walk resolves repository paths with no leak under a concurrent symlink-swap race test, and rejects linked worktrees, `commondir`, alternates, grafts, and symlinked `.git` entries.
-6. `pack.window=0` cuts the silent time before the first byte of `bundle/create` on large incompressible data from 24.7 s to 7.5 s at 264 MiB, with the same bundle size.
+6. Delta search dominates the silent time before the first byte of `bundle/create` on large incompressible data. `pack.window=0` fixes the time but makes a bundle of 200 small agent commits about 19 times larger (76,753 B against 1,459,406 B in the same run). `core.bigFileThreshold=4m` fixes the time (264 MiB of random blobs: 24.6 s down to 4.7 s in a plain git run) and leaves small-commit bundles the same size or smaller.
+7. `git fetch` from a bundle with `transfer.fsckObjects=true` accepted the malformed commit on git 2.34 and 2.39 and rejected it on 2.47. `git index-pack --strict` rejected it on all three, so the client helper should import the same way execd does.

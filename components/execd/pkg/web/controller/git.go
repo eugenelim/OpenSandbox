@@ -320,9 +320,10 @@ func (r *repo) gitCmd(ctx context.Context, p gitPolicy, args ...string) (*exec.C
 		)
 	}
 	if len(args) > 0 && args[0] == "bundle" {
-		// Reuse existing deltas and skip the delta search, which dominates the
-		// silent time before the first response byte on large incompressible data.
-		pre = append(pre, "-c", "pack.window=0")
+		// Objects over 4 MiB are not delta-searched. The search dominates the
+		// silent time before the first response byte on large incompressible
+		// blobs, and small text objects still delta normally.
+		pre = append(pre, "-c", "core.bigFileThreshold=4m")
 	}
 	cmd := exec.CommandContext(ctx, bin, append(pre, args...)...)
 	cmd.Env = []string{
