@@ -57,6 +57,7 @@ func NewRouter(accessToken string) *gin.Engine {
 	registerFilesystemRoutes(r.Group("/v1/filesystem/:uid/:gid", filesystemIdentityMiddleware()))
 
 	registerExecutionRoutes(r)
+	registerGitRoutes(r)
 	return r
 }
 
