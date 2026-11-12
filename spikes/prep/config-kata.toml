@@ -1,0 +1,22 @@
+[server]
+host = "127.0.0.1"
+port = 18091
+api_key = "spike-key"
+[proxy]
+resolve_internal = true
+[runtime]
+type = "docker"
+execd_image = "opensandbox/execd:v1.1.0"
+[secure_runtime]
+type = "kata"
+docker_runtime = "kata-runtime"
+[store]
+type = "sqlite"
+path = "/tmp/spikes/os-kata.db"
+[docker]
+network_mode = "bridge"
+port_range_min = 44000
+port_range_max = 44900
+[egress]
+image = "opensandbox/egress:v1.1.7"
+mode = "dns+nft"

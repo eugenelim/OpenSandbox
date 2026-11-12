@@ -1,0 +1,16 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: ade-spike-kata
+  region: REGION_PLACEHOLDER
+  tags: { TAG_KEY_PLACEHOLDER: "TAG_VALUE_PLACEHOLDER", Owner: OWNER_PLACEHOLDER, Project: ade-spike, Environment: demo, Expires: "EXPIRES_PLACEHOLDER" }
+managedNodeGroups:
+- { name: system, instanceType: t3.medium, desiredCapacity: 1, minSize: 1, maxSize: 1 }
+- name: kata
+  amiFamily: AmazonLinux2023
+  instanceType: c5.metal
+  desiredCapacity: 1
+  minSize: 1
+  maxSize: 1
+  volumeSize: 100
+  labels: { ade/runtime: kata }

@@ -1,0 +1,39 @@
+# OpenSandbox umbrella overrides for the Kata-on-EKS spike (Docker Hub rc.2 images; Kata via secure_runtime).
+opensandbox-controller:
+  controller:
+    image: { repository: opensandbox/controller, tag: release-1.2.1-rc.2 }
+    snapshot:
+      imageCommitterImage: "opensandbox/image-committer:release-1.2.1-rc.2"
+opensandbox-server:
+  server:
+    image: { repository: opensandbox/server, tag: release-1.2.1-rc.2 }
+    env:
+    - { name: OPENSANDBOX_INSECURE_SERVER, value: "YES" }
+  configToml: |
+    [server]
+    host = "0.0.0.0"
+    port = 80
+    api_key = ""
+
+    [log]
+    level = "INFO"
+
+    [runtime]
+    type = "kubernetes"
+    execd_image = "opensandbox/execd:release-1.2.1-rc.2"
+
+    [kubernetes]
+    kubeconfig_path = ""
+    namespace = "opensandbox"
+    informer_resync_seconds = 300
+    informer_watch_timeout_seconds = 60
+    workload_provider = "batchsandbox"
+    batchsandbox_template_file = "/etc/opensandbox/example.batchsandbox-template.yaml"
+
+    [secure_runtime]
+    type = "kata"
+    k8s_runtime_class = "kata-clh"
+
+    [egress]
+    image = "opensandbox/egress:release-1.2.1-rc.2"
+    mode = "dns+nft"

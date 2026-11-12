@@ -1,0 +1,42 @@
+# F5 (UNTESTED): an explicit allow-list forward proxy that runs on the managed node group (not Fargate).
+# Replace the image with a mirrored, digest-pinned copy before use in a corporate account.
+apiVersion: v1
+kind: Namespace
+metadata: { name: egress-proxy }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: squid-conf, namespace: egress-proxy }
+data:
+  squid.conf: |
+    http_port 3128
+    acl allowed dstdomain pypi.org files.pythonhosted.org
+    acl SSL_ports port 443
+    acl CONNECT method CONNECT
+    http_access deny CONNECT !SSL_ports
+    http_access allow allowed
+    http_access deny all
+    access_log stdio:/dev/stdout
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: squid, namespace: egress-proxy }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: squid } }
+  template:
+    metadata: { labels: { app: squid } }
+    spec:
+      containers:
+      - name: squid
+        image: ubuntu/squid:latest
+        ports: [{ containerPort: 3128 }]
+        volumeMounts: [{ name: conf, mountPath: /etc/squid/squid.conf, subPath: squid.conf }]
+      volumes: [{ name: conf, configMap: { name: squid-conf } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: squid, namespace: egress-proxy }
+spec:
+  selector: { app: squid }
+  ports: [{ port: 3128, targetPort: 3128 }]

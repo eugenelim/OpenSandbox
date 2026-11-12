@@ -1,0 +1,19 @@
+# Throwaway cluster: a tainted, labelled node group whose bootstrap installs runsc (UNTESTED bootstrap).
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: ade-spike-gvisor
+  region: REGION_PLACEHOLDER
+  tags: { TAG_KEY_PLACEHOLDER: "TAG_VALUE_PLACEHOLDER", Owner: OWNER_PLACEHOLDER, Project: ade-spike, Environment: demo, Expires: "EXPIRES_PLACEHOLDER" }
+managedNodeGroups:
+- name: gvisor
+  amiFamily: AmazonLinux2023
+  instanceType: t3.large
+  desiredCapacity: 1
+  minSize: 1
+  maxSize: 1
+  labels: { ade/runtime: gvisor }
+  taints: [{ key: ade/sandbox, value: "true", effect: NoSchedule }]
+  preBootstrapCommands:
+  - "curl -fsSL https://raw.githubusercontent.com/placeholder/replace-with-userdata-contents >/dev/null 2>&1 || true  # replaced by gvisor-spike.sh with eksctl/gvisor-nodegroup.userdata.sh"
+- { name: system, instanceType: t3.medium, desiredCapacity: 1, minSize: 1, maxSize: 1 }

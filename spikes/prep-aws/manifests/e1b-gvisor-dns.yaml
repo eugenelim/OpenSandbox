@@ -1,0 +1,21 @@
+# gvisor-dns: egress sidecar in mode dns, shaped like server/opensandbox_server/services/k8s/egress_helper.py
+apiVersion: v1
+kind: Pod
+metadata: { name: gvisor-dns, namespace: gvisor-spike, labels: { spike: gvisor } }
+spec:
+  runtimeClassName: gvisor
+  restartPolicy: Never
+  containers:
+  - name: app
+    image: public.ecr.aws/docker/library/alpine:3.20
+    securityContext: { capabilities: { drop: ["NET_ADMIN"] } }
+    command: ["sh","-c","apk add -q curl bind-tools >/dev/null 2>&1; sleep 3600"]
+  - name: egress
+    image: opensandbox/egress:v1.1.7
+    securityContext: { capabilities: { add: ["NET_ADMIN"] } }
+    ports: [{ name: egress-api, containerPort: 18080 }]
+    env:
+    - { name: OPENSANDBOX_EGRESS_MODE, value: "dns" }
+    - name: OPENSANDBOX_EGRESS_RULES
+      value: '{"defaultAction":"deny","egress":[{"action":"allow","target":"pypi.org"},{"action":"allow","target":"files.pythonhosted.org"}]}'
+    readinessProbe: { httpGet: { path: /healthz, port: 18080 }, periodSeconds: 1, failureThreshold: 30 }

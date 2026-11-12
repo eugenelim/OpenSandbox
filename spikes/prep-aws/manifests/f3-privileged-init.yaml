@@ -1,0 +1,15 @@
+# F3: execd init container is privileged when egress.disable_ipv6 is enabled. Expect rejection on Fargate.
+apiVersion: v1
+kind: Pod
+metadata: { name: privileged-init, namespace: fargate-spike, labels: { fargate: spike } }
+spec:
+  restartPolicy: Never
+  initContainers:
+  - name: init
+    image: public.ecr.aws/docker/library/alpine:3.20
+    securityContext: { privileged: true }
+    command: ["sh","-c","echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 && echo IPV6_DISABLED"]
+  containers:
+  - name: app
+    image: public.ecr.aws/docker/library/alpine:3.20
+    command: ["sh","-c","echo started; sleep 600"]

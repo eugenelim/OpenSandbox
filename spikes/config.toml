@@ -1,0 +1,22 @@
+[server]
+host = "127.0.0.1"
+port = 18080
+api_key = "spike-key"
+[proxy]
+resolve_internal = false
+[log]
+level = "INFO"
+[runtime]
+type = "docker"
+execd_image = "opensandbox/execd:v1.1.0"
+[store]
+type = "sqlite"
+path = "/tmp/spikes/os.db"
+[docker]
+network_mode = "bridge"
+port_range_min = 41000
+port_range_max = 41400
+host_ip = "127.0.0.1"
+[egress]
+image = "opensandbox/egress:v1.1.7"
+mode = "dns+nft"

@@ -1,0 +1,11 @@
+# Proves the pod really runs under gVisor: gVisor's dmesg prints its own boot lines.
+apiVersion: v1
+kind: Pod
+metadata: { name: gvisor-active, namespace: gvisor-spike, labels: { spike: gvisor } }
+spec:
+  runtimeClassName: gvisor
+  restartPolicy: Never
+  containers:
+  - name: app
+    image: public.ecr.aws/docker/library/alpine:3.20
+    command: ["sh","-c","dmesg | head -5; uname -r; sleep 300"]

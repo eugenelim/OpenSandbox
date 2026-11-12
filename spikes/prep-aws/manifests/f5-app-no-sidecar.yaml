@@ -1,0 +1,16 @@
+# F5 (UNTESTED): a Fargate pod with NO sidecar and no NET_ADMIN. It is told to use the proxy; enforcement is meant to come
+# from the security group (SecurityGroupPolicy, applied by the script in stage 2), not from the pod.
+apiVersion: v1
+kind: Pod
+metadata: { name: app-no-sidecar, namespace: fargate-spike, labels: { fargate: spike, role: sandbox } }
+spec:
+  restartPolicy: Never
+  containers:
+  - name: app
+    image: public.ecr.aws/docker/library/alpine:3.20
+    securityContext: { capabilities: { drop: ["ALL"] } }
+    env:
+    - { name: HTTP_PROXY,  value: "http://squid.egress-proxy.svc:3128" }
+    - { name: HTTPS_PROXY, value: "http://squid.egress-proxy.svc:3128" }
+    - { name: NO_PROXY,    value: "localhost,127.0.0.1" }
+    command: ["sh","-c","apk add -q curl bind-tools >/dev/null 2>&1; sleep 3600"]

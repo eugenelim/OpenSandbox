@@ -1,0 +1,22 @@
+[server]
+host = "127.0.0.1"
+port = 18090
+api_key = "spike-key"
+[proxy]
+resolve_internal = true
+[runtime]
+type = "docker"
+execd_image = "opensandbox/execd:v1.1.0"
+[secure_runtime]
+type = "gvisor"
+docker_runtime = "runsc"
+[store]
+type = "sqlite"
+path = "/tmp/spikes/os-gvisor.db"
+[docker]
+network_mode = "bridge"
+port_range_min = 43000
+port_range_max = 43900
+[egress]
+image = "opensandbox/egress:v1.1.7"
+mode = "dns+nft"
