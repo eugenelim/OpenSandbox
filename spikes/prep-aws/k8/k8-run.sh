@@ -7,7 +7,8 @@ IMG=public.ecr.aws/docker/library/python:3.12-slim; ALP=public.ecr.aws/docker/li
 sec(){ echo; echo "== $*"; }
 runpod(){ # name runtime node-selector-json-or-empty image cmd...
   local n=$1 rc=$2 sel=$3 img=$4; shift 4
-  local ov="{\"spec\":{\"runtimeClassName\":\"$rc\"${sel:+,\"nodeSelector\":$sel}}}"
+  local rcj=""; [ -n "$rc" ] && rcj="\"runtimeClassName\":\"$rc\""
+  local ov="{\"spec\":{$rcj${rcj:+${sel:+,}}${sel:+\"nodeSelector\":$sel}}}"
   kubectl -n $NS run $n --image=$img --restart=Never --overrides="$ov" --command -- "$@" >/dev/null 2>&1
 }
 waitdone(){ for i in $(seq 1 100); do ph=$(kubectl -n $NS get pod $1 -o jsonpath='{.status.phase}' 2>/dev/null); [ "$ph" = Succeeded -o "$ph" = Failed ] && return; sleep 3; done; }
@@ -18,13 +19,17 @@ helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-d
 sleep 90; kubectl get runtimeclass kata-qemu kata-clh 2>&1 | cut -c1-80
 kubectl create namespace $NS >/dev/null 2>&1; kubectl create namespace opensandbox >/dev/null 2>&1
 sec opensandbox-install
-( cd "$REPO/manifests/charts" && helm dependency build opensandbox 2>&1 | tail -1 && helm install opensandbox opensandbox --namespace opensandbox-system --create-namespace -f "$HERE/values-k8.yaml" --timeout 8m 2>&1 | tail -2 )
+( cd "$REPO/manifests/charts" && helm dependency build opensandbox 2>&1 | tail -1 && helm install opensandbox opensandbox --namespace opensandbox-system --create-namespace -f "$HERE/values-k8.yaml" ${SNAPSHOT_REGISTRY:+--set opensandbox-controller.controller.snapshot.registry=$SNAPSHOT_REGISTRY} --timeout 8m 2>&1 | tail -2 )
 kubectl -n opensandbox-system rollout status deploy/opensandbox-controller-manager --timeout=300s 2>&1 | tail -1
 kubectl -n opensandbox-system rollout status deploy/opensandbox-server --timeout=300s 2>&1 | tail -1
 kubectl -n opensandbox-system get pods 2>&1 | cut -c1-110
 sec K8-K9
 kubectl -n opensandbox-system port-forward svc/opensandbox-server 18080:80 >/tmp/pf.log 2>&1 &
 PF=$!; sleep 6
+echo "-- raw create probe (status, headers, body)"
+curl -s -i -X POST http://127.0.0.1:18080/v1/sandboxes -H 'Content-Type: application/json' -d "{\"image\":{\"uri\":\"$IMG\"},\"entrypoint\":[\"tail\",\"-f\",\"/dev/null\"],\"timeout\":600,\"resourceLimits\":{\"cpu\":\"500m\",\"memory\":\"512Mi\"}}" 2>&1 | head -25 | cut -c1-300
+echo "-- openapi paths"; curl -s http://127.0.0.1:18080/openapi.json | python3 -c "import sys,json;print(sorted(json.load(sys.stdin).get('paths',{}))[:12])" 2>&1 | cut -c1-300
+kubectl -n opensandbox-system logs deploy/opensandbox-server --tail=40 2>&1 | grep -vE "GET /health" | tail -12 | cut -c1-260
 "$PY" "$HERE/k8.py" "$IMG" 2>&1 | tail -70
 kubectl -n opensandbox get pods -o custom-columns=NAME:.metadata.name,RC:.spec.runtimeClassName,NODE:.spec.nodeName 2>&1 | head -5
 kill $PF 2>/dev/null
@@ -48,7 +53,7 @@ sec K10-hypervisor-kill
 runpod victim kata-clh '{"ade/node":"metal"}' $ALP sleep 3600; runpod bystander-clh kata-clh '{"ade/node":"metal"}' $ALP sleep 3600; runpod bystander-runc "" '{"ade/node":"metal"}' $ALP sleep 3600
 kubectl -n $NS wait --for=condition=Ready pod/victim pod/bystander-clh pod/bystander-runc --timeout=180s 2>&1 | tail -1
 N=$(kubectl -n $NS get pod victim -o jsonpath='{.spec.nodeName}'); kubectl debug node/$N -q --image=$ALP --profile=sysadmin -- sleep 600 >/dev/null 2>&1; sleep 8; D=$(kubectl get pods -o name | grep node-debugger | head -1 | cut -d/ -f2)
-echo "killing cloud-hypervisor processes on $N (all kata-clh VMs there)"; kubectl exec $D -- chroot /host sh -c 'pgrep -a cloud-hypervisor | wc -l; pkill -9 cloud-hypervisor; sleep 1; pgrep -a cloud-hypervisor | wc -l' 2>&1 | tr '\n' ' '; echo
+echo "killing cloud-hypervisor processes on $N (all kata-clh VMs there)"; kubectl exec $D -- nsenter -t 1 -m -p -- sh -c 'pgrep -af "cloud-hypervisor|qemu-system" | cut -c1-80; pkill -9 -f cloud-hypervisor; sleep 1; echo remaining: $(pgrep -f cloud-hypervisor | wc -l)' 2>&1 | tr '\n' ' '; echo
 sleep 20; kubectl -n $NS get pods victim bystander-clh bystander-runc --no-headers 2>&1 | cut -c1-90
 kubectl -n $NS get pod victim -o jsonpath='{.status.containerStatuses[0].state}{"\n"}' | cut -c1-200
 kubectl -n $NS delete pod victim bystander-clh bystander-runc oom --wait=false >/dev/null 2>&1
@@ -90,6 +95,7 @@ for rc in kata-clh kata-qemu; do
   s=$(date +%s); runpod nest-$rc $rc '{"ade/node":"nested"}' $ALP sh -c 'uname -r; nproc; grep MemTotal /proc/meminfo; sleep 3600'
   kubectl -n $NS wait --for=condition=Ready pod/nest-$rc --timeout=300s >/dev/null 2>&1; echo "$rc nested ready after $(( $(date +%s)-s )) s: $(sleep 5; kubectl -n $NS logs nest-$rc 2>&1 | tr '\n' ' ')"
 done
+kubectl -n $NS delete pod nest-kata-clh nest-kata-qemu --wait=true >/dev/null 2>&1
 for rc in kata-clh; do
   runpod k5n $rc '{"ade/node":"nested"}' $IMG sh -c 'cd /tmp && python3 - <<P
 import time,os
