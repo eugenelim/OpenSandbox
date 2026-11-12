@@ -22,13 +22,25 @@ async def main():
         await step("info", sb.get_info())
         await step("snapshot", sb.create_snapshot("k9-snap"))
         await step("pause", sb.pause())
-        await asyncio.sleep(20)
-        await step("info_after_pause", sb.get_info())
+        t0 = time.time(); state = ""
+        while time.time() - t0 < 240:
+            info = await sb.get_info(); state = str(getattr(info.status, "state", info.status))
+            if "aused" in state: break
+            await asyncio.sleep(5)
+        res["pause_poll"] = {"final_state": state, "secs": round(time.time() - t0, 1)}
         r2 = await step("resume", Sandbox.resume(sb.id, connection_config=cfg)) if hasattr(Sandbox, "resume") else None
         if r2:
-            ex = await step("cmd_after_resume", r2.commands.run("cat /tmp/k8.txt"))
+            ex = await step("cmd_after_resume", r2.commands.run("cat /tmp/k8.txt; uname -r"))
             if ex: res["cmd_after_resume"]["out"] = [l.text.strip() for l in ex.logs.stdout]
             sb = r2
+        snap = res.get("snapshot", {}).get("v", "")
+        sid = snap.split("id='")[1].split("'")[0] if "id='" in snap else None
+        if sid:
+            rs = await step("restore_from_snapshot", Sandbox.create(snapshot_id=sid, entrypoint=["tail", "-f", "/dev/null"], timeout=timedelta(minutes=10), connection_config=cfg))
+            if rs:
+                ex = await step("restore_cmd", rs.commands.run("cat /tmp/k8.txt; uname -r"))
+                if ex: res["restore_cmd"]["out"] = [l.text.strip() for l in ex.logs.stdout]
+                await step("restore_kill", rs.kill())
         await step("kill", sb.kill())
         try: await sb.close()
         except Exception: pass
