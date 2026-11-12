@@ -12,6 +12,7 @@ runpod(){ # name runtime node-selector-json-or-empty image cmd...
 }
 waitdone(){ for i in $(seq 1 100); do ph=$(kubectl -n $NS get pod $1 -o jsonpath='{.status.phase}' 2>/dev/null); [ "$ph" = Succeeded -o "$ph" = Failed ] && return; sleep 3; done; }
 CLUSTER=${CLUSTER:-ade-spike-k9}
+if [ "${EGRESS_ENDPOINTS:-1}" = 1 ]; then sec egress-endpoints; "$PA/egress-endpoints.sh" up $CLUSTER 2>&1 | tail -6; "$PA/egress-endpoints.sh" warm docker/library/busybox 1.37; fi
 sec tag; "$PA/tag-resources.sh" $CLUSTER 2>&1 | tail -3 | cut -c1-160
 sec nodes; kubectl get nodes -L node.kubernetes.io/instance-type,ade/node 2>&1 | cut -c1-150
 sec kata-deploy
@@ -143,6 +144,8 @@ sec K12-kata-fc
 echo "K12 runs on the nested node (KVM inside the VM); the metal node keeps the default shims"
 kubectl exec $DN -- nsenter -t 1 -m -p -- sh -c 'set -e; mkdir -p /var/lib/containerd/devmapper; cd /var/lib/containerd/devmapper; [ -f data ] || { truncate -s 30G data; truncate -s 2G meta; }; D=$(losetup --find --show data); M=$(losetup --find --show meta); S=$(blockdev --getsize64 $D); dmsetup create kata-thinpool --table "0 $((S/512)) thin-pool $M $D 128 32768 1 skip_block_zeroing"; dmsetup status kata-thinpool; grep -nE "^imports|SystemdCgroup" /etc/containerd/config.toml | head -3' 2>&1 | tail -4
 cat > /tmp/fc-dropin.toml <<'Y'
+[plugins."io.containerd.cri.v1.images"]
+  discard_unpacked_layers = false
 [plugins."io.containerd.snapshotter.v1.devmapper"]
   root_path = "/var/lib/containerd/devmapper"
   pool_name = "kata-thinpool"
@@ -154,9 +157,10 @@ echo "-- install pods"; kubectl -n kube-system get pods --no-headers 2>&1 | grep
 for P in $(kubectl -n kube-system get pods --no-headers 2>/dev/null | awk '/kata-deploy-install/ {print $1}'); do echo "-- describe $P"; kubectl -n kube-system describe pod $P 2>&1 | grep -E "Node:|State:|Reason:|Warning|Events|Back-off|Failed" | head -8 | cut -c1-200; echo "-- logs cri"; kubectl -n kube-system logs $P -c cri --tail=15 2>&1 | cut -c1-220; done
 echo "-- node containerd journal (nested)"; kubectl exec $DN -- nsenter -t 1 -m -p -- sh -c 'journalctl -u containerd --since "-12min" --no-pager 2>/dev/null | grep -aiE "devmapper|error|fail|panic|plugin" | tail -10 | cut -c1-240; ctr plugins ls 2>/dev/null | grep -i devmapper'
 kubectl get runtimeclass kata-fc 2>&1 | cut -c1-80; kubectl get node $NN --show-labels 2>&1 | grep -o "katacontainers[^,]*" | head -3
-runpod fc kata-fc '{"ade/node":"nested"}' $ALP sh -c 'uname -r; sleep 600'; kubectl -n $NS wait --for=condition=Ready pod/fc --timeout=240s 2>&1 | tail -1; sleep 10; kubectl -n $NS logs fc 2>&1 | head -2; kubectl -n $NS get pod fc --no-headers | cut -c1-70
+REGP="$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com"; runpod fc kata-fc '{"ade/node":"nested"}' $REGP/ecr-public/docker/library/busybox:1.37 sh -c 'uname -r; sleep 600'; kubectl -n $NS wait --for=condition=Ready pod/fc --timeout=240s 2>&1 | tail -1; sleep 10; kubectl -n $NS logs fc 2>&1 | head -2; kubectl -n $NS get pod fc --no-headers | cut -c1-70
 kubectl -n $NS describe pod fc 2>&1 | grep -E "Warning|Error|Failed" | head -4 | cut -c1-240
 fi
 sec ecr-cleanup
+[ "${EGRESS_ENDPOINTS:-1}" = 1 ] && "$PA/egress-endpoints.sh" down $CLUSTER 2>&1 | tail -3
 aws ecr delete-repository --repository-name opensandbox-snapshots --force --query repository.repositoryName --output text 2>&1 | tail -1
 sec done
