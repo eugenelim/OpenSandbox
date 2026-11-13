@@ -1,0 +1,17 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: ade-spike-pool
+  region: REGION_PLACEHOLDER
+  tags: { TAG_KEY_PLACEHOLDER: "TAG_VALUE_PLACEHOLDER", Owner: OWNER_PLACEHOLDER, Project: ade-spike, Environment: demo, Expires: "EXPIRES_PLACEHOLDER" }
+vpc:
+  clusterEndpoints: { publicAccess: true, privateAccess: true }
+managedNodeGroups:
+- { name: system, instanceType: t3.large, desiredCapacity: 1, minSize: 1, maxSize: 1 }
+- name: nested
+  amiFamily: AmazonLinux2023
+  desiredCapacity: 1
+  minSize: 1
+  maxSize: 1
+  labels: { ade/runtime: kata, ade/node: nested }
+  launchTemplate: { id: NESTED_LT_ID_PLACEHOLDER, version: "2" }

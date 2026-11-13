@@ -1,0 +1,50 @@
+# Warm pool for the pooled-authentication test: Kata runtime, execd/task-executor installers, egress sidecar with a default-deny policy.
+apiVersion: sandbox.opensandbox.io/v1alpha1
+kind: Pool
+metadata:
+  name: pool-a
+  namespace: opensandbox
+spec:
+  template:
+    metadata:
+      labels: { app: pool-a }
+    spec:
+      runtimeClassName: kata-clh
+      volumes:
+      - { name: sandbox-storage, emptyDir: {} }
+      - { name: opensandbox-bin, emptyDir: {} }
+      - { name: sandbox-logs, emptyDir: {} }
+      initContainers:
+      - name: task-executor-installer
+        image: opensandbox/task-executor:release-1.2.1
+        command: ["/bin/sh","-c"]
+        args: ["cp /workspace/server /opt/opensandbox/task-executor && chmod +x /opt/opensandbox/task-executor"]
+        volumeMounts: [{ name: opensandbox-bin, mountPath: /opt/opensandbox }]
+      - name: execd-installer
+        image: opensandbox/execd:release-1.2.1
+        command: ["/bin/sh","-c"]
+        args: ["cp ./execd /opt/opensandbox/execd && cp ./bootstrap.sh /opt/opensandbox/bootstrap.sh && chmod +x /opt/opensandbox/execd /opt/opensandbox/bootstrap.sh"]
+        volumeMounts: [{ name: opensandbox-bin, mountPath: /opt/opensandbox }]
+      containers:
+      - name: sandbox
+        image: public.ecr.aws/docker/library/python:3.12-slim
+        command: ["/bin/sh","-c","/opt/opensandbox/task-executor -listen-addr=0.0.0.0:5758 -log-dir=/tmp"]
+        securityContext: { capabilities: { drop: ["NET_ADMIN"] } }
+        env:
+        - { name: SANDBOX_MAIN_CONTAINER, value: main }
+        - { name: EXECD_ENVS, value: /opt/opensandbox/.env }
+        - { name: EXECD, value: /opt/opensandbox/execd }
+        volumeMounts:
+        - { name: sandbox-storage, mountPath: /var/lib/sandbox }
+        - { name: opensandbox-bin, mountPath: /opt/opensandbox }
+        - { name: sandbox-logs, mountPath: /workspace/logs }
+      - name: egress
+        image: opensandbox/egress:release-1.2.1
+        securityContext: { capabilities: { add: ["NET_ADMIN"] } }
+        ports: [{ name: egress-api, containerPort: 18080 }]
+        env:
+        - { name: OPENSANDBOX_EGRESS_MODE, value: "dns+nft" }
+        - { name: OPENSANDBOX_EGRESS_TOKEN, value: "pool-a-shared-secret" }
+        - { name: OPENSANDBOX_EGRESS_RULES, value: '{"defaultAction":"deny","egress":[]}' }
+      tolerations: [{ operator: Exists }]
+  capacitySpec: { bufferMin: 2, bufferMax: 3, poolMax: 5, poolMin: 2 }
