@@ -1,0 +1,35 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: ade-spike-k10
+  region: REGION_PLACEHOLDER
+  tags: { TAG_KEY_PLACEHOLDER: "TAG_VALUE_PLACEHOLDER", Owner: OWNER_PLACEHOLDER, Project: ade-spike, Environment: demo, Expires: "EXPIRES_PLACEHOLDER" }
+vpc:
+  clusterEndpoints: { publicAccess: true, privateAccess: true }
+managedNodeGroups:
+- { name: system, instanceType: t3.large, desiredCapacity: 1, minSize: 1, maxSize: 1 }
+- name: metal
+  amiFamily: AmazonLinux2023
+  instanceType: c5.metal
+  desiredCapacity: 1
+  minSize: 1
+  maxSize: 1
+  volumeSize: 100
+  labels: { ade/runtime: kata, ade/node: metal }
+- name: nested
+  amiFamily: AmazonLinux2023
+  desiredCapacity: 1
+  minSize: 1
+  maxSize: 1
+  labels: { ade/runtime: kata, ade/node: nested }
+  launchTemplate: { id: NESTED_LT_ID_PLACEHOLDER, version: "2" }
+- name: nested-l
+  amiFamily: AmazonLinux2023
+  desiredCapacity: 1
+  minSize: 1
+  maxSize: 1
+  labels: { ade/runtime: kata, ade/node: nested-l }
+  launchTemplate: { id: NESTED_LT_ID_PLACEHOLDER, version: "3" }
+fargateProfiles:
+- name: spike
+  selectors: [{ namespace: fargate-spike, labels: { fargate: spike } }]

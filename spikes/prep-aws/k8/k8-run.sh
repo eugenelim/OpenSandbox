@@ -45,11 +45,11 @@ kubectl -n opensandbox-system rollout status deploy/opensandbox-controller-manag
 kubectl -n opensandbox-system rollout status deploy/opensandbox-server --timeout=300s 2>&1 | tail -1
 kubectl -n opensandbox-system get pods 2>&1 | cut -c1-110
 sec K8-K9
-kubectl -n opensandbox-system port-forward svc/opensandbox-server 18080:80 >/tmp/pf.log 2>&1 &
+kubectl -n opensandbox-system port-forward svc/opensandbox-server ${OS_PORT:-18090}:80 >/tmp/pf.log 2>&1 &
 PF=$!; sleep 6
 echo "-- raw create probe (status, headers, body)"
-curl -s -i -X POST http://127.0.0.1:18080/v1/sandboxes -H 'Content-Type: application/json' -d "{\"image\":{\"uri\":\"$IMG\"},\"entrypoint\":[\"tail\",\"-f\",\"/dev/null\"],\"timeout\":600,\"resourceLimits\":{\"cpu\":\"500m\",\"memory\":\"512Mi\"}}" 2>&1 | head -25 | cut -c1-300
-echo "-- openapi paths"; curl -s http://127.0.0.1:18080/openapi.json | python3 -c "import sys,json;print(sorted(json.load(sys.stdin).get('paths',{}))[:12])" 2>&1 | cut -c1-300
+curl -s -i -X POST http://127.0.0.1:${OS_PORT:-18090}/v1/sandboxes -H 'Content-Type: application/json' -d "{\"image\":{\"uri\":\"$IMG\"},\"entrypoint\":[\"tail\",\"-f\",\"/dev/null\"],\"timeout\":600,\"resourceLimits\":{\"cpu\":\"500m\",\"memory\":\"512Mi\"}}" 2>&1 | head -25 | cut -c1-300
+echo "-- openapi paths"; curl -s http://127.0.0.1:${OS_PORT:-18090}/openapi.json | python3 -c "import sys,json;print(sorted(json.load(sys.stdin).get('paths',{}))[:12])" 2>&1 | cut -c1-300
 kubectl -n opensandbox-system logs deploy/opensandbox-server --tail=40 2>&1 | grep -vE "GET /health" | tail -12 | cut -c1-260
 "$PY" "$HERE/k8.py" "$IMG" 2>&1 | tail -70
 kubectl -n opensandbox get pods -o custom-columns=NAME:.metadata.name,RC:.spec.runtimeClassName,NODE:.spec.nodeName 2>&1 | head -5

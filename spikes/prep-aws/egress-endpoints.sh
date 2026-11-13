@@ -9,8 +9,8 @@ case "$A" in
 up)
   K=${ADE_TAG_KEY:?}; V=${ADE_TAG_VALUE:?}; O=${ADE_OWNER:?}; X=${ADE_EXPIRES:?}
   VPC=$(vpc); SG=$(aws eks describe-cluster --name "$CL" --query cluster.resourcesVpcConfig.clusterSecurityGroupId --output text)
-  mapfile -t SUBS < <(aws ec2 describe-instances --filters "Name=vpc-id,Values=$VPC" Name=instance-state-name,Values=running --query 'Reservations[].Instances[].SubnetId' --output text | tr '\t' '\n' | sort -u)
-  mapfile -t RTS < <(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC" --query 'RouteTables[].RouteTableId' --output text | tr '\t' '\n')
+  SUBS=( $(aws ec2 describe-instances --filters "Name=vpc-id,Values=$VPC" Name=instance-state-name,Values=running --query 'Reservations[].Instances[].SubnetId' --output text | tr '\t' '\n' | sort -u) )
+  RTS=( $(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC" --query 'RouteTables[].RouteTableId' --output text) )
   TAGS="ResourceType=vpc-endpoint,Tags=[{Key=$K,Value=$V},{Key=Owner,Value=$O},{Key=Project,Value=ade-spike},{Key=Environment,Value=demo},{Key=Expires,Value=$X}]"
   for S in ecr.api ecr.dkr; do aws ec2 create-vpc-endpoint --vpc-id "$VPC" --vpc-endpoint-type Interface --service-name "com.amazonaws.$R.$S" --subnet-ids "${SUBS[@]}" --security-group-ids "$SG" --private-dns-enabled --tag-specifications "$TAGS" --query 'VpcEndpoint.VpcEndpointId' --output text; done
   aws ec2 create-vpc-endpoint --vpc-id "$VPC" --vpc-endpoint-type Gateway --service-name "com.amazonaws.$R.s3" --route-table-ids "${RTS[@]}" --tag-specifications "$TAGS" --query 'VpcEndpoint.VpcEndpointId' --output text
@@ -21,7 +21,7 @@ up)
 warm) # one registry GET with the caller's credentials makes ECR import the upstream image
   curl -s -o /dev/null -w "warm $2:$3 -> %{http_code}\n" -u "AWS:$(aws ecr get-login-password --region "$R")" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" "https://$REG/v2/ecr-public/$2/manifests/$3";;
 down)
-  VPC=$(vpc); mapfile -t E < <(aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$VPC" --query 'VpcEndpoints[].VpcEndpointId' --output text | tr '\t' '\n')
+  VPC=$(vpc); E=( $(aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$VPC" --query 'VpcEndpoints[].VpcEndpointId' --output text) )
   [ -n "${E[0]:-}" ] && aws ec2 delete-vpc-endpoints --vpc-endpoint-ids "${E[@]}" --query Unsuccessful --output text
   for REPO in $(aws ecr describe-repositories --query "repositories[?starts_with(repositoryName,'ecr-public/')].repositoryName" --output text); do aws ecr delete-repository --repository-name "$REPO" --force --query repository.repositoryName --output text; done
   aws ecr delete-pull-through-cache-rule --ecr-repository-prefix ecr-public --query ecrRepositoryPrefix --output text 2>&1 | tail -1;;
